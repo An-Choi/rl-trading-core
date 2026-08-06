@@ -1,0 +1,7 @@
+# application-smoke.yml
+smoke:
+  clock-at: "2026-07-21T11:00:00"  # historical 데이터가 있는 거래일의 KST 시각
+  start-bar: "10:05"               # warmup(09:05~10:00)은 전부 expected stale — 성공 가능 구간부터
+  bars: 6                          # 10:05~10:30
+  mode: replay                     # replay | restore-only (재기동 검증은 restore-only —
+                                   # 같은 bar를 다시 돌리면 currentBar < entryBarTs 음수 오류)
