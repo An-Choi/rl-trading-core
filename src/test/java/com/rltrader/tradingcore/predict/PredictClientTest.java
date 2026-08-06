@@ -82,4 +82,35 @@ class PredictClientTest {
                 .isInstanceOfSatisfying(PredictFailureException.class,
                         e -> assertThat(e.code()).isEqualTo("CONNECTION"));
     }
+
+    @Test
+    void unknownPropertyIsAllowed() {
+        // additive 계약: 서버가 새 필드를 추가해도 unknown property로 실패하면 안 됨 (spec §2 검증 ①)
+        String withUnknownField = OK_BODY.replace(
+                "\"bar_close\": 71000.0", "\"bar_close\": 71000.0, \"future_field\": 1");
+        server.stubFor(post("/predict").willReturn(okJson(withUnknownField)));
+        PredictResult result = client.predict(PredictRequest.flat("005930", 10_000.0, null));
+        assertThat(result.body().action()).isEqualTo(1);
+        assertThat(result.body().barClose()).isEqualTo(71_000.0);
+    }
+
+    @Test
+    void slowResponseMapsToTimeout() {
+        // 테스트 props의 readTimeoutMs=2000ms보다 긴 지연 — read timeout 경로 검증
+        server.stubFor(post("/predict").willReturn(okJson(OK_BODY).withFixedDelay(3000)));
+        assertThatThrownBy(() -> client.predict(PredictRequest.flat("005930", 10_000.0, null)))
+                .isInstanceOfSatisfying(PredictFailureException.class,
+                        e -> assertThat(e.code()).isEqualTo("TIMEOUT"));
+    }
+
+    @Test
+    void numberToBooleanCoercionRejected() {
+        // strict mapper: action_mask의 정수(1/0) → boolean 강제 변환 금지 (spec §2 검증 ①)
+        String coerced = OK_BODY.replace(
+                "\"action_mask\": [true, true, false]", "\"action_mask\": [1, 0, 1]");
+        server.stubFor(post("/predict").willReturn(okJson(coerced)));
+        assertThatThrownBy(() -> client.predict(PredictRequest.flat("005930", 10_000.0, null)))
+                .isInstanceOfSatisfying(PredictFailureException.class,
+                        e -> assertThat(e.code()).isEqualTo("PARSE"));
+    }
 }
