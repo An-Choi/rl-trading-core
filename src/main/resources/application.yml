@@ -1,0 +1,23 @@
+spring:
+  datasource:
+    url: jdbc:postgresql://localhost:5432/tradingcore
+    username: tradingcore
+    password: tradingcore
+  jpa:
+    hibernate:
+      ddl-auto: validate
+    open-in-view: false
+  flyway:
+    enabled: true
+
+trading:
+  symbol: "005930"
+  predict-base-url: "http://127.0.0.1:8000"
+  delay-seconds: 20
+  max-units-cap: 5
+  max-capital-cap: 10000.0      # full position 상한 (KRW) — Spring 소유 hard cap
+  dry-run-initial-cash: 10000.0 # env_params.initial_cash와 일치 권장 (spec §2)
+  connect-timeout-ms: 5000
+  read-timeout-ms: 240000       # /predict 전용 (KIS fetch 최악 ~208초)
+  control-timeout-ms: 5000      # /ready·/metadata 전용 — ready 폴링이 deadline을 초과해 막히지 않게
+  ready-wait-max-seconds: 60
