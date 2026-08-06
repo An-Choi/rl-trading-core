@@ -1,6 +1,7 @@
 package com.rltrader.tradingcore.domain;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import java.time.LocalTime;
 import java.time.ZonedDateTime;
@@ -49,5 +50,12 @@ class TradingGridTest {
         // 목(08-06) 09:05 → 금(08-07) 09:05: (2-1)*76 + 0 = 76
         assertThat(TradingGrid.barsBetween(
                 kst("2026-08-06T09:05:00"), kst("2026-08-07T09:05:00"))).isEqualTo(76);
+    }
+
+    @Test
+    void barsBetweenRejectsReversedArguments() {
+        assertThatThrownBy(() -> TradingGrid.barsBetween(
+                kst("2026-08-06T11:00:00"), kst("2026-08-06T10:05:00")))
+                .isInstanceOf(IllegalArgumentException.class);
     }
 }

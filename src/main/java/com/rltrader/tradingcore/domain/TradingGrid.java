@@ -46,6 +46,10 @@ public final class TradingGrid {
     public static long barsBetween(ZonedDateTime entryBar, ZonedDateTime currentBar) {
         ZonedDateTime entry = entryBar.withZoneSameInstant(KST);
         ZonedDateTime current = currentBar.withZoneSameInstant(KST);
+        if (current.isBefore(entry)) {
+            throw new IllegalArgumentException(
+                    "currentBar " + currentBar + " precedes entryBar " + entryBar);
+        }
         int entryOffset = offsetOf(entry.toLocalTime()).orElseThrow(
                 () -> new IllegalArgumentException("entry bar not on grid: " + entryBar));
         int currentOffset = offsetOf(current.toLocalTime()).orElseThrow(
