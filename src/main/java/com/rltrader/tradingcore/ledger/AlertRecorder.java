@@ -24,6 +24,7 @@ import tools.jackson.databind.ObjectMapper;
 public class AlertRecorder {
 
     private static final Logger log = LoggerFactory.getLogger(AlertRecorder.class);
+    private static final int CODE_MAX_LENGTH = 32;   // alerts.code VARCHAR(32) (V1__init.sql)
 
     private final AlertRepository alerts;
     private final ObjectMapper mapper;
@@ -37,7 +38,9 @@ public class AlertRecorder {
         log.error("[ALERT] code={} barTs={} detail={}", code, barTs, detail);
         try {
             AlertEntity e = new AlertEntity();
-            e.setCode(code);
+            // 컬럼 길이를 넘는 code는 best-effort INSERT 전체를 실패시켜 계약 위반 상황에서
+            // 오히려 행을 잃는다 — truncate로 저장은 보장한다.
+            e.setCode(code.length() > CODE_MAX_LENGTH ? code.substring(0, CODE_MAX_LENGTH) : code);
             e.setBarTs(barTs != null ? barTs.toOffsetDateTime() : null);
             e.setDetail(mapper.writeValueAsString(detail));
             alerts.save(e);

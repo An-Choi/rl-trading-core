@@ -34,6 +34,23 @@ docker compose up -d postgres
 건너뛰고 `SKIPPED_BUSY` 알림을 남긴다. Halted 상태(`ARTIFACT_CHANGED` 등 치명 위반) 이후에는
 재기동 전까지 신규 사이클이 발화하지 않는다.
 
+## 알림(Alert) 코드
+
+구조화 로그(ERROR)가 필수 채널이고 `alerts` 테이블 INSERT는 best-effort다(spec §5). 코드는
+DB 컬럼 제약(VARCHAR(32))에 맞춰 32자로 truncate되어 저장된다.
+
+| 코드 | 발생 조건 |
+|---|---|
+| `INVALID_RESPONSE` | `/predict` 200 응답 본문이 구조·건전성 검증 실패(필드 누락·NaN·mask 길이 등) |
+| `PREDICT_PARSE` | `/predict` 200 응답 본문 파싱/coercion 실패 |
+| `PREDICT_STALE_DATA` | warmup(10:05 이전) 이후에도 predict가 `STALE_DATA`로 실패 (warmup 이내는 무알림) |
+| `ARTIFACT_CHANGED` | 응답의 `artifact_id`/`feature_schema_version`이 핸드셰이크와 불일치 — 스케줄러 halt |
+| `WRONG_BAR` | 응답의 `bar_ts`가 요청한 bar와 불일치(staleness 허용창의 직전 bar 등) |
+| `MASK_VIOLATION` | `action_mask` 위반 또는 risk gate(한도·현금 부족 등) 거부 |
+| `DB_ERROR` | 사이클 트랜잭션 커밋 중 DB 실패(UNIQUE 중복이 아닌 무결성 위반 포함) |
+| `SKIPPED_BUSY` | single-flight 겹침으로 tick이 건너뜀 |
+| `UNEXPECTED_ERROR` | `runCycle`이 열거되지 않은 `RuntimeException`을 던짐 — 상태 무변경, 스케줄러는 계속 진행 |
+
 ## Smoke 실행 (기동 검증)
 
 운영 스케줄러 없이 지정한 bar들을 즉시 순차 실행해 배포 직후 파이프라인 전체(핸드셰이크 → 복원 →

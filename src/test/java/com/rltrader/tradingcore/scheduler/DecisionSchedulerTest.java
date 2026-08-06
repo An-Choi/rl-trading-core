@@ -8,7 +8,6 @@ import com.rltrader.tradingcore.cycle.CycleOutcome;
 import com.rltrader.tradingcore.cycle.DecisionCycleService;
 import com.rltrader.tradingcore.ledger.AlertRecorder;
 import java.time.Clock;
-import java.time.Instant;
 import java.time.ZonedDateTime;
 import java.util.concurrent.CountDownLatch;
 import org.junit.jupiter.api.Test;
@@ -69,6 +68,29 @@ class DecisionSchedulerTest {
         release.countDown();
         first.join();
         verify(cycle, times(1)).runCycle(any(), any());
+    }
+
+    @Test
+    void unexpectedRuntimeExceptionFromCycleIsAlertedNotPropagated() {
+        DecisionCycleService cycle = mock(DecisionCycleService.class);
+        when(cycle.isHalted()).thenReturn(false);
+        RuntimeException boom = new IllegalStateException("boom");
+        when(cycle.runCycle(any(), any())).thenThrow(boom);
+        AlertRecorder alerts = mock(AlertRecorder.class);
+        DecisionScheduler scheduler = new DecisionScheduler(
+                cycle, alerts, fixedAt("2026-08-06T11:00:20"));
+        scheduler.enable();
+
+        scheduler.tick();   // 예외가 스케줄러 스레드로 전파되지 않아야 함
+
+        verify(alerts).record(eq("UNEXPECTED_ERROR"),
+                eq(ZonedDateTime.parse("2026-08-06T11:00:00+09:00[Asia/Seoul]")), any());
+        // lock이 해제되어 후속 tick이 정상적으로 재진입 가능해야 함
+        reset(cycle);
+        when(cycle.isHalted()).thenReturn(false);
+        when(cycle.runCycle(any(), any())).thenReturn(CycleOutcome.EXECUTED);
+        scheduler.tick();
+        verify(cycle).runCycle(any(), any());
     }
 
     @Test

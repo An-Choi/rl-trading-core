@@ -9,7 +9,8 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.locks.ReentrantLock;
-import org.springframework.lang.Nullable;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Component;
 
 /**
@@ -19,6 +20,8 @@ import org.springframework.stereotype.Component;
  */
 @Component
 public class DecisionScheduler {
+
+    private static final Logger log = LoggerFactory.getLogger(DecisionScheduler.class);
 
     private final DecisionCycleService cycle;
     private final AlertRecorder alerts;
@@ -52,6 +55,11 @@ public class DecisionScheduler {
         }
         try {
             cycle.runCycle(bar.get(), null);   // 운영은 as_of 항상 생략 (계약)
+        } catch (RuntimeException e) {
+            // 열거되지 않은 실패 — runCycle 계약상 상태는 이미 무변경. 스케줄러 스레드로
+            // 전파하면 알림 없이 죽는 유일한 경로가 되므로(spec §6) 여기서 막는다.
+            log.error("[SCHEDULER] unexpected exception from runCycle at bar {}", bar.get(), e);
+            alerts.record("UNEXPECTED_ERROR", bar.get(), Map.of("reason", e.toString()));
         } finally {
             inFlight.unlock();
         }

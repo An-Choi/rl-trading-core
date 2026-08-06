@@ -35,6 +35,7 @@ class DecisionCycleIntegrationTest extends AbstractIntegrationTest {
     @Autowired ExecutionRepository executions;
     @Autowired AlertRepository alerts;
     @Autowired PortfolioSnapshotRepository snapshots;
+    @Autowired AlertRecorder alertRecorder;
 
     static final ZonedDateTime BAR =
             ZonedDateTime.parse("2026-08-06T11:00:00+09:00[Asia/Seoul]");
@@ -70,6 +71,46 @@ class DecisionCycleIntegrationTest extends AbstractIntegrationTest {
         assertThat(decisions.count()).isEqualTo(1);
         assertThat(executions.count()).isEqualTo(1);
         assertThat(snapshots.findById("005930")).isPresent();
+    }
+
+    @Test
+    void holdLeavesStateFullyUnchangedButRecordsDecisionAndExecution() {
+        wiremock.stubFor(post("/predict").willReturn(okJson(
+                okBody(0, "hold", "2026-08-06T11:00:00+09:00"))));
+        CycleOutcome outcome = cycle.runCycle(BAR, null);
+        assertThat(outcome).isEqualTo(CycleOutcome.EXECUTED);
+        assertThat(portfolio.current().units()).isZero();
+        assertThat(portfolio.current().shares()).isZero();
+        assertThat(portfolio.current().cash()).isEqualTo(10_000.0);
+        assertThat(portfolio.current().entryBarTs()).isNull();
+        assertThat(decisions.count()).isEqualTo(1);
+        assertThat(executions.count()).isEqualTo(1);
+    }
+
+    @Test
+    void addThenClearRestoresFlatStateAndClearsEntryBarTs() {
+        wiremock.stubFor(post("/predict").willReturn(okJson(
+                okBody(1, "add_unit", "2026-08-06T11:00:00+09:00"))));
+        CycleOutcome added = cycle.runCycle(BAR, null);
+        assertThat(added).isEqualTo(CycleOutcome.EXECUTED);
+        assertThat(portfolio.current().units()).isEqualTo(1);
+        assertThat(portfolio.current().entryBarTs()).isNotNull();
+        assertThat(snapshots.findById("005930").orElseThrow().getEntryBarTs()).isNotNull();
+
+        ZonedDateTime clearBar = BAR.plusMinutes(5);
+        wiremock.stubFor(post("/predict").willReturn(okJson(
+                okBody(2, "clear", "2026-08-06T11:05:00+09:00"))));
+        CycleOutcome cleared = cycle.runCycle(clearBar, null);
+
+        assertThat(cleared).isEqualTo(CycleOutcome.EXECUTED);
+        assertThat(portfolio.current().units()).isZero();
+        assertThat(portfolio.current().shares()).isZero();
+        // add_unit 지출(1990) 후 같은 bar_close(71000.0)로 청산 — cash가 초기값으로 정확히 복원
+        assertThat(portfolio.current().cash()).isEqualTo(10_000.0);
+        assertThat(portfolio.current().entryBarTs()).isNull();
+        assertThat(decisions.count()).isEqualTo(2);
+        assertThat(executions.count()).isEqualTo(2);
+        assertThat(snapshots.findById("005930").orElseThrow().getEntryBarTs()).isNull();
     }
 
     @Test
@@ -182,5 +223,16 @@ class DecisionCycleIntegrationTest extends AbstractIntegrationTest {
         assertThat(portfolio.current().units()).isZero();
         CycleOutcome retry = cycle.runCycle(BAR, null);
         assertThat(retry).isEqualTo(CycleOutcome.EXECUTED);     // 재시도 성공 (UNIQUE 미오염)
+    }
+
+    @Test
+    void recordTruncatesOversizedCodeToFitColumn() {
+        // alerts.code는 VARCHAR(32) — 초과 시 truncate하지 않으면 best-effort INSERT가
+        // 통째로 실패해 계약 위반 상황에서 오히려 행을 잃는다
+        String oversized = "A".repeat(35);
+        assertThat(oversized.length()).isEqualTo(35);
+        alertRecorder.record(oversized, BAR, java.util.Map.of());
+        assertThat(alerts.findAll())
+                .anyMatch(a -> a.getCode().equals("A".repeat(32)) && a.getCode().length() == 32);
     }
 }
