@@ -13,6 +13,7 @@ import com.rltrader.tradingcore.predict.ArtifactContext;
 import java.time.ZonedDateTime;
 import org.junit.jupiter.api.*;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.test.annotation.DirtiesContext;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
 
@@ -137,6 +138,8 @@ class DecisionCycleIntegrationTest extends AbstractIntegrationTest {
     }
 
     @Test
+    @DirtiesContext   // TradingHaltState.halt()는 되돌릴 수 없다(spec §7) — 이 테스트 뒤 컨텍스트를 폐기해
+                       // 다른 테스트가 halted=true인 공용 싱글턴을 물려받지 않게 한다 (Task 12)
     void artifactChangeHaltsScheduler() {
         String body = okBody(0, "hold", "2026-08-06T11:00:00+09:00")
                 .replace("ppo-fs3-x", "ppo-fs3-NEW");

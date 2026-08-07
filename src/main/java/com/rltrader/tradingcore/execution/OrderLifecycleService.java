@@ -77,6 +77,10 @@ public class OrderLifecycleService {
         boolean liquidationCarried = snapshots.findById(order.getSymbol())
                 .map(PortfolioSnapshotEntity::isLiquidationPending)
                 .orElse(false);
+        // Task 12: 이 runChain 호출 안에서 fill-timeout(취소 경로)을 한 번이라도 거쳤는지 —
+        // attempt 루프 전체에 걸쳐 누적(재시도로 이어져도 true 유지). ChainOutcome.hadTimeout으로
+        // 노출해 Task 13의 POST_ORDER 강제 대사 트리거 판정에 쓰인다.
+        boolean hadTimeout = false;
         // attempt 루프 (Task 9): 각 반복 시작 시 prior를 DB에서 재조회한다 — 직전 attempt의
         // finalization이 accounted를 이미 커밋했으므로, 인프로세스 연속 attempt와 재시작 후
         // 재개가 동일 코드 경로가 된다 (in-process/restart 동형성).
@@ -116,6 +120,7 @@ public class OrderLifecycleService {
             }
 
             // — 타임아웃(또는 terminalCandidate가 아니지만 데드라인 도달): 취소
+            hadTimeout = true;
             finalization.transition(order, OrderStatus.CANCEL_PENDING, Map.of());
             cancelOrThrow(order);
             KisOrderSnapshot confirmed = confirmOrThrow(order);
@@ -123,7 +128,7 @@ public class OrderLifecycleService {
             if (confirmed.cumulativeFilledQty() >= order.getQty()) {
                 // 레이스: 취소 확정 조회가 전량 체결을 반환 — 체결 우선
                 ChainOutcome outcome = finalizeFilled(order, confirmed, barTs, before, ctx,
-                        priorAccountedQty, priorNotional);
+                        priorAccountedQty, priorNotional, hadTimeout);
                 return outcome;
             }
 
@@ -168,7 +173,7 @@ public class OrderLifecycleService {
                         ChainNext.liquidation(), ctx, TransitionMode.NORMAL);
                 alerts.record("PARTIAL_CLEAR_EOD", barTs, Map.of(
                         "decisionId", decisionId, "filledQty", decisionTotalQty, "remainingQty", remaining));
-                return new ChainOutcome(after, priorNotional.add(currentNotional), decisionTotalQty, true);
+                return new ChainOutcome(after, priorNotional.add(currentNotional), decisionTotalQty, true, hadTimeout);
             }
 
             // 체인 종료 (add 포기 또는 clear 전량 소진): units는 Sigma filled(total) > 0 조건부
@@ -184,7 +189,7 @@ public class OrderLifecycleService {
                 alerts.record("EXECUTION_FAILED", barTs, Map.of(
                         "decisionId", decisionId, "orderedQty", plan.qty()));
             }
-            return new ChainOutcome(after, priorNotional.add(currentNotional), decisionTotalQty, false);
+            return new ChainOutcome(after, priorNotional.add(currentNotional), decisionTotalQty, false, hadTimeout);
         }
     }
 
@@ -199,11 +204,12 @@ public class OrderLifecycleService {
         if (confirmed.cumulativeFilledQty() < order.getQty()) {
             return null;
         }
-        return finalizeFilled(order, confirmed, barTs, before, ctx, priorAccountedQty, priorNotional);
+        return finalizeFilled(order, confirmed, barTs, before, ctx, priorAccountedQty, priorNotional, false);
     }
 
     private ChainOutcome finalizeFilled(OrderEntity order, KisOrderSnapshot confirmed, ZonedDateTime barTs,
-            PortfolioState before, ArtifactContext ctx, long priorAccountedQty, BigDecimal priorNotional) {
+            PortfolioState before, ArtifactContext ctx, long priorAccountedQty, BigDecimal priorNotional,
+            boolean hadTimeout) {
         KisBalance balance = balanceOrThrow();
         long currentAttemptQty = confirmed.cumulativeFilledQty();
         BigDecimal currentNotional = confirmed.cumulativeAvgPrice()
@@ -212,7 +218,7 @@ public class OrderLifecycleService {
         PortfolioState after = applyFill(before, order, barTs, currentAttemptQty, decisionTotalQty, balance, true);
         finalization.finalizeChain(order, OrderStatus.FILLED, confirmed, after, ChainNext.markCompleted(),
                 ctx, TransitionMode.NORMAL);
-        return new ChainOutcome(after, priorNotional.add(currentNotional), decisionTotalQty, false);
+        return new ChainOutcome(after, priorNotional.add(currentNotional), decisionTotalQty, false, hadTimeout);
     }
 
     /**
@@ -310,7 +316,7 @@ public class OrderLifecycleService {
         alerts.record("ORDER_REJECTED", barTs, Map.of(
                 "decisionId", decisionId, "rtCd", rejected.rtCd(), "msg", rejected.msg(),
                 "side", order.getSide(), "rejectRetryMaxReached", upperBoundReached));
-        return new ChainOutcome(before, priorNotional, priorAccountedQty, order.getSide() == OrderSide.SELL);
+        return new ChainOutcome(before, priorNotional, priorAccountedQty, order.getSide() == OrderSide.SELL, false);
     }
 
     /**
@@ -329,7 +335,7 @@ public class OrderLifecycleService {
         finalization.finalizeChain(order, OrderStatus.ABORTED, null, before, next, ctx, TransitionMode.NORMAL);
         alerts.record("ORDER_SUBMIT_ABORTED", barTs, Map.of(
                 "decisionId", decisionId, "side", order.getSide()));
-        return new ChainOutcome(before, priorNotional, priorAccountedQty, order.getSide() == OrderSide.SELL);
+        return new ChainOutcome(before, priorNotional, priorAccountedQty, order.getSide() == OrderSide.SELL, false);
     }
 
     /**

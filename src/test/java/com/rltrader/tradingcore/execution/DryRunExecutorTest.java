@@ -19,7 +19,7 @@ class DryRunExecutorTest {
     @Test
     void firstAddSetsEntryBarTs() {
         FillResult r = executor.execute(TradeAction.ADD_UNIT,
-                PortfolioState.flat(10_000.0), 71_000.0, BAR, CTX);
+                PortfolioState.flat(10_000.0), 71_000.0, BAR, CTX, 1L);
         assertThat(r.newState().units()).isEqualTo(1);
         assertThat(r.newState().shares()).isCloseTo(1_990.0 / 71_000.0, offset(1e-12));
         assertThat(r.newState().cash()).isCloseTo(10_000.0 - 1_990.0, offset(1e-9));
@@ -30,7 +30,7 @@ class DryRunExecutorTest {
     void secondAddKeepsEntryBarTs() {
         ZonedDateTime entry = BAR.minusMinutes(30);
         PortfolioState held = new PortfolioState(1, 0.028, 8_010.0, entry);
-        FillResult r = executor.execute(TradeAction.ADD_UNIT, held, 71_000.0, BAR, CTX);
+        FillResult r = executor.execute(TradeAction.ADD_UNIT, held, 71_000.0, BAR, CTX, 1L);
         assertThat(r.newState().units()).isEqualTo(2);
         assertThat(r.newState().entryBarTs()).isEqualTo(entry); // 추가 Add — 유지
     }
@@ -38,7 +38,7 @@ class DryRunExecutorTest {
     @Test
     void holdChangesNothing() {
         PortfolioState held = new PortfolioState(1, 0.028, 8_010.0, BAR.minusMinutes(30));
-        FillResult r = executor.execute(TradeAction.HOLD, held, 71_000.0, BAR, CTX);
+        FillResult r = executor.execute(TradeAction.HOLD, held, 71_000.0, BAR, CTX, 1L);
         assertThat(r.newState()).isEqualTo(held);
         assertThat(r.sharesDelta()).isZero();
     }
@@ -46,7 +46,7 @@ class DryRunExecutorTest {
     @Test
     void clearLiquidatesAndResetsEntry() {
         PortfolioState held = new PortfolioState(2, 0.056, 6_020.0, BAR.minusMinutes(30));
-        FillResult r = executor.execute(TradeAction.CLEAR, held, 71_000.0, BAR, CTX);
+        FillResult r = executor.execute(TradeAction.CLEAR, held, 71_000.0, BAR, CTX, 1L);
         assertThat(r.newState().units()).isZero();
         assertThat(r.newState().shares()).isZero();
         assertThat(r.newState().cash()).isCloseTo(6_020.0 + 0.056 * 71_000.0, offset(1e-9));
