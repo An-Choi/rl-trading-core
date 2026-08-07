@@ -53,6 +53,6 @@ public class PortfolioManager {
         }
         ZonedDateTime entry = s.getEntryBarTs() != null
                 ? s.getEntryBarTs().atZoneSameInstant(TradingGrid.KST) : null;
-        state.set(new PortfolioState(s.getUnits(), s.getShares(), s.getCash(), entry));
+        state.set(new PortfolioState(s.getUnits(), s.getShares().doubleValue(), s.getCash().doubleValue(), entry));
     }
 }

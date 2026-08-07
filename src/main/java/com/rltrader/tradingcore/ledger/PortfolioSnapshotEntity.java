@@ -4,6 +4,7 @@ import jakarta.persistence.Column;
 import jakarta.persistence.Entity;
 import jakarta.persistence.Id;
 import jakarta.persistence.Table;
+import java.math.BigDecimal;
 import java.time.OffsetDateTime;
 
 @Entity
@@ -18,10 +19,10 @@ public class PortfolioSnapshotEntity {
     private int units;
 
     @Column(nullable = false)
-    private double shares;
+    private BigDecimal shares;
 
     @Column(nullable = false)
-    private double cash;
+    private BigDecimal cash;
 
     @Column(name = "entry_bar_ts")
     private OffsetDateTime entryBarTs;
@@ -31,6 +32,9 @@ public class PortfolioSnapshotEntity {
 
     @Column(name = "updated_at", nullable = false)
     private OffsetDateTime updatedAt;
+
+    @Column(name = "liquidation_pending", nullable = false)
+    private boolean liquidationPending;
 
     public String getSymbol() {
         return symbol;
@@ -48,20 +52,20 @@ public class PortfolioSnapshotEntity {
         this.units = units;
     }
 
-    public double getShares() {
+    public BigDecimal getShares() {
         return shares;
     }
 
     public void setShares(double shares) {
-        this.shares = shares;
+        this.shares = BigDecimal.valueOf(shares);
     }
 
-    public double getCash() {
+    public BigDecimal getCash() {
         return cash;
     }
 
     public void setCash(double cash) {
-        this.cash = cash;
+        this.cash = BigDecimal.valueOf(cash);
     }
 
     public OffsetDateTime getEntryBarTs() {
@@ -86,5 +90,13 @@ public class PortfolioSnapshotEntity {
 
     public void setUpdatedAt(OffsetDateTime updatedAt) {
         this.updatedAt = updatedAt;
+    }
+
+    public boolean isLiquidationPending() {
+        return liquidationPending;
+    }
+
+    public void setLiquidationPending(boolean liquidationPending) {
+        this.liquidationPending = liquidationPending;
     }
 }
