@@ -97,6 +97,30 @@ class OrderLifecycleHappyPathTest extends AbstractIntegrationTest {
     }
 
     @Test
+    void second_add_unit_increments_existing_units_and_preserves_entry_bar() {
+        long d = decisionWithNewOrder(10);
+        when(broker.submitMarketOrder("005930", OrderSide.BUY, 10))
+                .thenReturn(new KisOrderAck("0001"));
+        when(broker.orderSnapshot(eq("0001"), any(LocalDate.class)))
+                .thenReturn(Optional.of(new KisOrderSnapshot(
+                        "0001", 10, 10, new BigDecimal("101.5"), true, false)));
+        when(broker.balance()).thenReturn(new KisBalance(20, new BigDecimal("6985.00")));
+
+        // 이미 unit 1개(shares 10) 보유 상태에서 두 번째 ADD_UNIT 체인 — RiskGate가
+        // max-units-cap(기본 5)까지 허용하는 multi-unit 시나리오 (RiskGateTest 참고)
+        var entryBar = TestFixtures.bar("2026-08-07T09:10");
+        var before = new PortfolioState(1, 10.0, 8985.00, entryBar);
+
+        ChainOutcome out = lifecycle.runChain(d, new OrderPlan(OrderSide.BUY, 10),
+                TestFixtures.bar("2026-08-07T09:35"), before, TestFixtures.ctx());
+
+        assertThat(out.after().units()).isEqualTo(2);                // +1, 아니라 하드코딩된 1이 아님
+        assertThat(out.after().shares()).isEqualTo(20.0);             // prior(10) + current(10)
+        assertThat(out.after().entryBarTs()).isEqualTo(entryBar);     // 최초 진입 bar 유지 (1차 규칙)
+        assertThat(snapshots.findById("005930").orElseThrow().getUnits()).isEqualTo(2);
+    }
+
+    @Test
     void intermediate_transitions_are_committed_individually() {
         long d = decisionWithNewOrder(10);
         when(broker.submitMarketOrder(any(), any(), anyLong())).thenReturn(new KisOrderAck("0001"));

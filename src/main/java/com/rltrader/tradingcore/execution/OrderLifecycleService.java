@@ -169,8 +169,8 @@ public class OrderLifecycleService {
      * units 판정은 decisionTotalQty > 0 기준(체인 최종 finalization에서만 갱신 — Task 9),
      * cash = balance.cashBalance().doubleValue()(예수금 절대값 투영). entry_bar_ts는 1차
      * DryRunExecutor와 동일 규칙: BUY로 처음 진입할 때만 새 bar로 세팅, CLEAR는 초기화.
-     * Phase 1 스코프(single symbol, "Unit" 용어) — 포지션은 전량 진입/전량 청산만 존재하므로
-     * unit은 0 또는 1이다.
+     * units은 DryRunExecutor와 동일하게 BUY→+1, CLEAR(전량 SELL)→0 — multi-unit
+     * (max-units-cap까지 누적 ADD_UNIT)을 RiskGate가 게이트하므로 여기서 1로 고정하면 안 된다.
      */
     private PortfolioState applyFill(PortfolioState before, OrderEntity order, ZonedDateTime barTs,
             long currentAttemptQty, long decisionTotalQty, KisBalance balance) {
@@ -185,6 +185,6 @@ public class OrderLifecycleService {
             return new PortfolioState(0, newShares, balance.cashBalance().doubleValue(), null);
         }
         ZonedDateTime entry = before.units() == 0 ? barTs : before.entryBarTs();
-        return new PortfolioState(1, newShares, balance.cashBalance().doubleValue(), entry);
+        return new PortfolioState(before.units() + 1, newShares, balance.cashBalance().doubleValue(), entry);
     }
 }

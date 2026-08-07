@@ -181,7 +181,9 @@ public class OrderFinalizationService {
      * 1차 persistCycle의 snapshot UPSERT 로직과 동일 + liquidationPending.
      * artifact provenance (Task 14 의존): NORMAL 모드는 ctx.artifactId()를 기록(1차 관례).
      * RECOVERY 모드는 기존 snapshot의 artifact_id를 보존하고, snapshot이 없어 신규 INSERT라면
-     * 이 decision의 artifact_id를 기록한다 — 복구가 다른 아티팩트로 잘못 덮어쓰지 않도록.
+     * **이 order가 속한 decision의 artifact_id**(order.getDecisionId() → DecisionRepository)를
+     * 기록한다 — ctx는 현재 프로세스가 로드한 아티팩트일 뿐 복구 대상 decision의 아티팩트와
+     * 다를 수 있으므로 RECOVERY 경로에서는 ctx를 쓰지 않는다.
      */
     private void saveSnapshot(OrderEntity order, PortfolioState after, ArtifactContext ctx,
             boolean liquidationPending, TransitionMode mode) {
@@ -193,7 +195,9 @@ public class OrderFinalizationService {
         s.setCash(after.cash());
         s.setEntryBarTs(after.entryBarTs() != null ? after.entryBarTs().toOffsetDateTime() : null);
         if (mode == TransitionMode.RECOVERY) {
-            s.setArtifactId(existing.isPresent() ? existing.get().getArtifactId() : ctx.artifactId());
+            String recoveryArtifactId = existing.isPresent() ? existing.get().getArtifactId()
+                    : decisions.findById(order.getDecisionId()).orElseThrow().getArtifactId();
+            s.setArtifactId(recoveryArtifactId);
         } else {
             s.setArtifactId(ctx.artifactId());
         }
