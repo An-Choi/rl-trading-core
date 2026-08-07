@@ -25,6 +25,11 @@ final class TestMutableClock extends Clock {
         now.updateAndGet(i -> i.plus(d));
     }
 
+    /** Task 10 — EOD 경계 테스트가 벽시계를 특정 시각으로 직접 지정하기 위한 헬퍼. */
+    void set(Instant instant) {
+        now.set(instant);
+    }
+
     @Override
     public ZoneId getZone() {
         return zone;

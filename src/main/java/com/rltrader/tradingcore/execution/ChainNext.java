@@ -17,7 +17,11 @@ public record ChainNext(boolean completed, OrderEntity nextAttempt, boolean liqu
         return new ChainNext(false, nextAttempt, false);
     }
 
+    /**
+     * EOD/진행불가 이월 (Task 10) — decision은 의도 미완이므로 completed=false로 남긴다
+     * (execution_status는 IN_PROGRESS 유지). liquidationPending=true만 원자 커밋.
+     */
     public static ChainNext liquidation() {
-        return new ChainNext(true, null, true);
+        return new ChainNext(false, null, true);
     }
 }

@@ -4,6 +4,7 @@ import com.rltrader.tradingcore.config.OrderProperties;
 import com.rltrader.tradingcore.domain.OrderSide;
 import com.rltrader.tradingcore.domain.OrderStatus;
 import com.rltrader.tradingcore.domain.PortfolioState;
+import com.rltrader.tradingcore.domain.TradingGrid;
 import com.rltrader.tradingcore.kis.BrokerPort;
 import com.rltrader.tradingcore.kis.KisBalance;
 import com.rltrader.tradingcore.kis.KisOrderAck;
@@ -16,6 +17,7 @@ import com.rltrader.tradingcore.predict.ArtifactContext;
 import java.math.BigDecimal;
 import java.time.Clock;
 import java.time.Instant;
+import java.time.LocalTime;
 import java.time.OffsetDateTime;
 import java.time.ZonedDateTime;
 import java.util.Map;
@@ -75,7 +77,7 @@ public class OrderLifecycleService {
             finalization.transition(order, OrderStatus.ACKED, Map.of("kisOrderNo", ack.kisOrderNo()));
 
             // — 체결 폴링: canonical filled_qty 단조 갱신, terminal 후보 판정만 (terminal 커밋 금지)
-            KisOrderSnapshot polled = pollUntilTerminalCandidate(order, deadline());
+            KisOrderSnapshot polled = pollUntilTerminalCandidate(order, deadline(barTs));
 
             boolean filledCandidate = polled != null
                     && (polled.cumulativeFilledQty() >= order.getQty() || (polled.brokerTerminal() && !polled.cancelled()));
@@ -108,16 +110,20 @@ public class OrderLifecycleService {
                     : confirmed.cumulativeAvgPrice().multiply(BigDecimal.valueOf(currentAttemptQty));
             long decisionTotalQty = priorAccountedQty + currentAttemptQty;
             long remaining = order.getQty() - currentAttemptQty;
-            boolean retry = order.getSide() == OrderSide.BUY && order.getAttempt() <= props.submitRetryMax()
-                    && remaining > 0;
-
-            // units 증분은 체인이 "끝나는" 호출에서만 한 번 반영한다(재시도로 이어지는 중간
-            // CANCELLED 커밋은 shares/cash만 갱신 — units는 이전 값 유지). 그렇지 않으면 attempt마다
-            // +1이 중복 반영된다.
-            PortfolioState after = applyFill(before, order, barTs, currentAttemptQty, decisionTotalQty,
-                    balance, !retry);
+            boolean eod = eodReached(clock.instant(), barTs);
+            // add(BUY): 재시도 1회 상한(Task 9). clear(SELL): 잔량이 있는 한 EOD·거부 상한 도달
+            // 전까지 반복(Task 10 — REJECTED 분기 자체는 Task 11 범위, 여기서는 상한 미도달 항상
+            // true로 취급해 EOD만이 종료 조건이 된다).
+            boolean retry = remaining > 0 && (order.getSide() == OrderSide.BUY
+                    ? order.getAttempt() <= props.submitRetryMax()
+                    : !eod);
 
             if (retry) {
+                // units 증분은 체인이 "끝나는" 호출에서만 한 번 반영한다(재시도로 이어지는 중간
+                // CANCELLED 커밋은 shares/cash만 갱신 — units는 이전 값 유지). 그렇지 않으면
+                // attempt마다 +1이 중복 반영된다.
+                PortfolioState after = applyFill(before, order, barTs, currentAttemptQty, decisionTotalQty,
+                        balance, false);
                 OrderEntity nextOrder = newAttempt(order, remaining);
                 finalization.finalizeChain(order, OrderStatus.CANCELLED, confirmed, after,
                         ChainNext.retry(nextOrder), ctx, TransitionMode.NORMAL);
@@ -126,8 +132,22 @@ public class OrderLifecycleService {
                 continue;
             }
 
-            // 체인 종료 (add 포기): units는 Sigma filled(total) > 0 조건부 +1 — applyFill이 체인
-            // 누계로 이미 판정했다.
+            if (order.getSide() == OrderSide.SELL && remaining > 0) {
+                // clear가 EOD(또는 진행불가)로 잔량을 남긴 채 종료 — 완료가 아니라 이월.
+                // units는 이전 값 유지(predict 미호출 — 관찰 없음), shares/cash만 반영.
+                PortfolioState after = applyFill(before, order, barTs, currentAttemptQty, decisionTotalQty,
+                        balance, false);
+                finalization.finalizeChain(order, OrderStatus.CANCELLED, confirmed, after,
+                        ChainNext.liquidation(), ctx, TransitionMode.NORMAL);
+                alerts.record("PARTIAL_CLEAR_EOD", barTs, Map.of(
+                        "decisionId", decisionId, "filledQty", decisionTotalQty, "remainingQty", remaining));
+                return new ChainOutcome(after, priorNotional.add(currentNotional), decisionTotalQty, true);
+            }
+
+            // 체인 종료 (add 포기 또는 clear 전량 소진): units는 Sigma filled(total) > 0 조건부
+            // +1/0 — applyFill이 체인 누계로 이미 판정했다.
+            PortfolioState after = applyFill(before, order, barTs, currentAttemptQty, decisionTotalQty,
+                    balance, true);
             finalization.finalizeChain(order, OrderStatus.CANCELLED, confirmed, after,
                     ChainNext.markCompleted(), ctx, TransitionMode.NORMAL);
             if (decisionTotalQty > 0) {
@@ -171,9 +191,10 @@ public class OrderLifecycleService {
     /**
      * 잔량 재주문용 다음 attempt — 원 주문 필드 복사 + attempt+1 + qty=잔량 + status=NEW.
      * 저장은 이 메서드가 하지 않는다 — finalization tx 안(ChainNext.retry)에서만 저장된다
-     * (체인 원자성, spec §2).
+     * (체인 원자성, spec §2). package-private — LiquidationService(Task 10)가 재개 attempt
+     * 구성에 재사용한다.
      */
-    private OrderEntity newAttempt(OrderEntity order, long remainingQty) {
+    OrderEntity newAttempt(OrderEntity order, long remainingQty) {
         OrderEntity next = new OrderEntity();
         next.setDecisionId(order.getDecisionId());
         next.setAttempt(order.getAttempt() + 1);
@@ -252,8 +273,40 @@ public class OrderLifecycleService {
         }
     }
 
-    private Instant deadline() {
+    /**
+     * 폴링 데드라인 (Task 10) — 15:20 grid 주문(barTs 15:20)은 특례: fillTimeoutMs가 아니라
+     * 절대 벽시계 closingAuctionDeadline(기본 15:35 KST)이 데드라인이다(min이 아니라 대체).
+     * 그 외 주문은 기존 규칙(제출/재개 시점 + fillTimeoutMs)을 그대로 쓴다.
+     */
+    private Instant deadline(ZonedDateTime barTs) {
+        if (isClosingAuctionOrder(barTs)) {
+            return closingAuctionDeadline(barTs);
+        }
         return clock.instant().plusMillis(props.fillTimeoutMs());
+    }
+
+    /**
+     * EOD 판정 (Task 10) — 15:20 특례 주문은 데드라인(closingAuctionDeadline) 도달 자체가 EOD,
+     * 그 외 일반 grid 주문은 15:30 KST 이후를 EOD로 본다.
+     */
+    boolean eodReached(Instant now, ZonedDateTime barTs) {
+        ZonedDateTime nowKst = now.atZone(TradingGrid.KST);
+        if (isClosingAuctionOrder(barTs)) {
+            return !now.isBefore(closingAuctionDeadline(barTs));
+        }
+        return !nowKst.toLocalTime().isBefore(LocalTime.of(15, 30));
+    }
+
+    private boolean isClosingAuctionOrder(ZonedDateTime barTs) {
+        return barTs != null
+                && barTs.withZoneSameInstant(TradingGrid.KST).toLocalTime().equals(TradingGrid.LAST_BAR);
+    }
+
+    /** props.closingAuctionDeadline()("HH:mm")을 barTs가 속한 거래일의 KST 절대시각으로 투영. */
+    private Instant closingAuctionDeadline(ZonedDateTime barTs) {
+        LocalTime deadline = LocalTime.parse(props.closingAuctionDeadline());
+        return barTs.withZoneSameInstant(TradingGrid.KST).toLocalDate()
+                .atTime(deadline).atZone(TradingGrid.KST).toInstant();
     }
 
     /** REST 확정 실패(전송 계층) → ChainIncompleteException 변환, 주문은 비종결 유지. */

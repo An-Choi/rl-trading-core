@@ -54,6 +54,35 @@ final class TestFixtures {
         return d.getId();
     }
 
+    /** clear(SELL) decision + NEW order — clear_chain 테스트 전용 (label="clear"). */
+    static long clearDecisionWithNewOrder(DecisionRepository decisions, OrderRepository orders, long qty) {
+        DecisionEntity d = new DecisionEntity();
+        d.setSymbol("005930");
+        d.setBarTs(OffsetDateTime.now());
+        d.setAction(2);
+        d.setLabel("clear");
+        d.setActionMask("[]");
+        d.setObservation("[]");
+        d.setBarClose(100.0);
+        d.setArtifactId(CTX.artifactId());
+        d.setExecutionStatus("IN_PROGRESS");
+        decisions.save(d);
+
+        OrderEntity o = new OrderEntity();
+        o.setDecisionId(d.getId());
+        o.setAttempt(1);
+        o.setTradingDate(LocalDate.of(2026, 8, 7));
+        o.setSymbol("005930");
+        o.setSide(OrderSide.SELL);
+        o.setQty(qty);
+        o.setOrderType("MARKET");
+        o.setStatus(OrderStatus.NEW);
+        o.setAccountedFillNotional(BigDecimal.ZERO);
+        orders.save(o);
+
+        return d.getId();
+    }
+
     static ZonedDateTime bar(String kstLocalDateTime) {
         return ZonedDateTime.of(LocalDateTime.parse(kstLocalDateTime), TradingGrid.KST);
     }
