@@ -9,6 +9,7 @@ import com.rltrader.tradingcore.kis.KisBalance;
 import com.rltrader.tradingcore.kis.KisOrderAck;
 import com.rltrader.tradingcore.kis.KisOrderSnapshot;
 import com.rltrader.tradingcore.kis.KisTransportException;
+import com.rltrader.tradingcore.ledger.AlertRecorder;
 import com.rltrader.tradingcore.ledger.OrderEntity;
 import com.rltrader.tradingcore.ledger.OrderRepository;
 import com.rltrader.tradingcore.predict.ArtifactContext;
@@ -36,53 +37,163 @@ public class OrderLifecycleService {
     private final OrderFinalizationService finalization;
     private final OrderProperties props;
     private final Clock clock;
+    private final AlertRecorder alerts;
 
     public OrderLifecycleService(BrokerPort broker, OrderRepository orders,
-            OrderFinalizationService finalization, OrderProperties props, Clock clock) {
+            OrderFinalizationService finalization, OrderProperties props, Clock clock,
+            AlertRecorder alerts) {
         this.broker = broker;
         this.orders = orders;
         this.finalization = finalization;
         this.props = props;
         this.clock = clock;
+        this.alerts = alerts;
     }
 
     public ChainOutcome runChain(long decisionId, OrderPlan plan, ZonedDateTime barTs,
             PortfolioState before, ArtifactContext ctx) {
         OrderEntity order = orders.findByDecisionIdAndStatus(decisionId, OrderStatus.NEW)
                 .orElseThrow(() -> new IllegalStateException("no NEW intent for decision " + decisionId));
-        // 체인 누계 3분리 (prior/current/total) — 절대 하나의 변수로 합치지 않는다:
-        //   priorAccountedQty  = DB 복원(이전 attempt들의 accounted 합) — before 스냅숏에 이미 반영됨
-        //   currentAttemptQty  = 이번 attempt의 REST 확정값
-        //   decisionTotalQty   = prior + current
-        // units 조건 판정은 total 기준, shares/cash 증감은 **current만** 적용(prior를 다시 더하면
-        // 이중 반영), ChainOutcome 누계는 total. notional도 동일 3분리.
-        // prior는 매 attempt 시작 시 DB 재조회한다(Task 9 루프) — 직전 attempt의 finalization이
-        // accounted를 커밋했으므로, 인프로세스 연속 attempt와 재시작 재개가 같은 코드가 된다.
-        final long priorAccountedQty = orders.sumAccountedFilledQtyByDecisionId(decisionId);
-        final BigDecimal priorNotional = orders.sumAccountedFillNotionalByDecisionId(decisionId);
+        // attempt 루프 (Task 9): 각 반복 시작 시 prior를 DB에서 재조회한다 — 직전 attempt의
+        // finalization이 accounted를 이미 커밋했으므로, 인프로세스 연속 attempt와 재시작 후
+        // 재개가 동일 코드 경로가 된다 (in-process/restart 동형성).
+        while (true) {
+            // 체인 누계 3분리 (prior/current/total) — 절대 하나의 변수로 합치지 않는다:
+            //   priorAccountedQty  = DB 복원(이전 attempt들의 accounted 합) — before 스냅숏에 이미 반영됨
+            //   currentAttemptQty  = 이번 attempt의 REST 확정값
+            //   decisionTotalQty   = prior + current
+            // units 조건 판정은 total 기준, shares/cash 증감은 **current만** 적용(prior를 다시 더하면
+            // 이중 반영), ChainOutcome 누계는 total. notional도 동일 3분리.
+            final long priorAccountedQty = orders.sumAccountedFilledQtyByDecisionId(decisionId);
+            final BigDecimal priorNotional = orders.sumAccountedFillNotionalByDecisionId(decisionId);
 
-        // — 제출 (Task 8 범위: 성공 ack 경로만. 거부·모호·재시도는 Task 9·10이 이 지점을 확장)
-        KisOrderAck ack = submitAttempt(order);
-        finalization.transition(order, OrderStatus.SUBMITTED, Map.of());
-        order.setKisOrderNo(ack.kisOrderNo());
-        order.setSubmittedAt(OffsetDateTime.now(clock));
-        finalization.transition(order, OrderStatus.ACKED, Map.of("kisOrderNo", ack.kisOrderNo()));
+            // — 제출 (Task 8 범위: 성공 ack 경로만. 거부·모호는 Task 10이 이 지점을 확장)
+            KisOrderAck ack = submitAttempt(order);
+            finalization.transition(order, OrderStatus.SUBMITTED, Map.of());
+            order.setKisOrderNo(ack.kisOrderNo());
+            order.setSubmittedAt(OffsetDateTime.now(clock));
+            finalization.transition(order, OrderStatus.ACKED, Map.of("kisOrderNo", ack.kisOrderNo()));
 
-        // — 체결 폴링: canonical filled_qty 단조 갱신, terminal 후보 판정만 (terminal 커밋 금지)
-        pollUntilTerminalCandidate(order, deadline());
+            // — 체결 폴링: canonical filled_qty 단조 갱신, terminal 후보 판정만 (terminal 커밋 금지)
+            KisOrderSnapshot polled = pollUntilTerminalCandidate(order, deadline());
 
-        // — REST 확정 조회 + 예수금 → finalization (실패 시 비종결 유지)
+            boolean filledCandidate = polled != null
+                    && (polled.cumulativeFilledQty() >= order.getQty() || (polled.brokerTerminal() && !polled.cancelled()));
+            if (filledCandidate) {
+                ChainOutcome outcome = confirmAndFinalizeFilled(order, barTs, before, ctx,
+                        priorAccountedQty, priorNotional);
+                if (outcome != null) {
+                    return outcome;
+                }
+                // confirm이 결국 전량 미체결로 판명 — 아래 취소 경로로 폴백하지 않고
+                // (이미 폴링이 terminalCandidate라 판단했으므로) 데드라인 도달로 취급한다.
+            }
+
+            // — 타임아웃(또는 terminalCandidate가 아니지만 데드라인 도달): 취소
+            finalization.transition(order, OrderStatus.CANCEL_PENDING, Map.of());
+            cancelOrThrow(order);
+            KisOrderSnapshot confirmed = confirmOrThrow(order);
+
+            if (confirmed.cumulativeFilledQty() >= order.getQty()) {
+                // 레이스: 취소 확정 조회가 전량 체결을 반환 — 체결 우선
+                ChainOutcome outcome = finalizeFilled(order, confirmed, barTs, before, ctx,
+                        priorAccountedQty, priorNotional);
+                return outcome;
+            }
+
+            // — 부분/전무 체결 취소 확정
+            KisBalance balance = balanceOrThrow();
+            long currentAttemptQty = confirmed.cumulativeFilledQty();
+            BigDecimal currentNotional = confirmed.cumulativeAvgPrice() == null ? BigDecimal.ZERO
+                    : confirmed.cumulativeAvgPrice().multiply(BigDecimal.valueOf(currentAttemptQty));
+            long decisionTotalQty = priorAccountedQty + currentAttemptQty;
+            long remaining = order.getQty() - currentAttemptQty;
+            boolean retry = order.getSide() == OrderSide.BUY && order.getAttempt() <= props.submitRetryMax()
+                    && remaining > 0;
+
+            // units 증분은 체인이 "끝나는" 호출에서만 한 번 반영한다(재시도로 이어지는 중간
+            // CANCELLED 커밋은 shares/cash만 갱신 — units는 이전 값 유지). 그렇지 않으면 attempt마다
+            // +1이 중복 반영된다.
+            PortfolioState after = applyFill(before, order, barTs, currentAttemptQty, decisionTotalQty,
+                    balance, !retry);
+
+            if (retry) {
+                OrderEntity nextOrder = newAttempt(order, remaining);
+                finalization.finalizeChain(order, OrderStatus.CANCELLED, confirmed, after,
+                        ChainNext.retry(nextOrder), ctx, TransitionMode.NORMAL);
+                order = nextOrder;
+                before = after;
+                continue;
+            }
+
+            // 체인 종료 (add 포기): units는 Sigma filled(total) > 0 조건부 +1 — applyFill이 체인
+            // 누계로 이미 판정했다.
+            finalization.finalizeChain(order, OrderStatus.CANCELLED, confirmed, after,
+                    ChainNext.markCompleted(), ctx, TransitionMode.NORMAL);
+            if (decisionTotalQty > 0) {
+                alerts.record("PARTIAL_UNIT", barTs, Map.of(
+                        "decisionId", decisionId, "filledQty", decisionTotalQty, "orderedQty", plan.qty()));
+            } else {
+                alerts.record("EXECUTION_FAILED", barTs, Map.of(
+                        "decisionId", decisionId, "orderedQty", plan.qty()));
+            }
+            return new ChainOutcome(after, priorNotional.add(currentNotional), decisionTotalQty, false);
+        }
+    }
+
+    /**
+     * 폴링이 terminalCandidate(전량 체결 또는 브로커 종결·미취소)로 판단했을 때의 확정 경로.
+     * 확정 조회가 실제로 전량 체결을 반환하면 finalize(FILLED)하고 결과를 반환한다. 그렇지 않으면
+     * (드묾 — 폴링 스냅숏과 확정 조회 사이 괴리) null을 반환해 호출부가 취소 경로로 폴백한다.
+     */
+    private ChainOutcome confirmAndFinalizeFilled(OrderEntity order, ZonedDateTime barTs,
+            PortfolioState before, ArtifactContext ctx, long priorAccountedQty, BigDecimal priorNotional) {
         KisOrderSnapshot confirmed = confirmOrThrow(order);
+        if (confirmed.cumulativeFilledQty() < order.getQty()) {
+            return null;
+        }
+        return finalizeFilled(order, confirmed, barTs, before, ctx, priorAccountedQty, priorNotional);
+    }
+
+    private ChainOutcome finalizeFilled(OrderEntity order, KisOrderSnapshot confirmed, ZonedDateTime barTs,
+            PortfolioState before, ArtifactContext ctx, long priorAccountedQty, BigDecimal priorNotional) {
         KisBalance balance = balanceOrThrow();
         long currentAttemptQty = confirmed.cumulativeFilledQty();
         BigDecimal currentNotional = confirmed.cumulativeAvgPrice()
                 .multiply(BigDecimal.valueOf(currentAttemptQty));
         long decisionTotalQty = priorAccountedQty + currentAttemptQty;
-        // applyFill은 current만 shares에 반영, units 판정은 decisionTotalQty > 0 기준
-        PortfolioState after = applyFill(before, order, barTs, currentAttemptQty, decisionTotalQty, balance);
+        PortfolioState after = applyFill(before, order, barTs, currentAttemptQty, decisionTotalQty, balance, true);
         finalization.finalizeChain(order, OrderStatus.FILLED, confirmed, after, ChainNext.markCompleted(),
                 ctx, TransitionMode.NORMAL);
         return new ChainOutcome(after, priorNotional.add(currentNotional), decisionTotalQty, false);
+    }
+
+    /**
+     * 잔량 재주문용 다음 attempt — 원 주문 필드 복사 + attempt+1 + qty=잔량 + status=NEW.
+     * 저장은 이 메서드가 하지 않는다 — finalization tx 안(ChainNext.retry)에서만 저장된다
+     * (체인 원자성, spec §2).
+     */
+    private OrderEntity newAttempt(OrderEntity order, long remainingQty) {
+        OrderEntity next = new OrderEntity();
+        next.setDecisionId(order.getDecisionId());
+        next.setAttempt(order.getAttempt() + 1);
+        next.setTradingDate(order.getTradingDate());
+        next.setSymbol(order.getSymbol());
+        next.setSide(order.getSide());
+        next.setQty(remainingQty);
+        next.setOrderType(order.getOrderType());
+        next.setStatus(OrderStatus.NEW);
+        next.setAccountedFillNotional(BigDecimal.ZERO);
+        return next;
+    }
+
+    /** 취소 전송 실패(KisTransportException)는 이 태스크에서는 비종결 유지로 전파. */
+    private void cancelOrThrow(OrderEntity order) {
+        try {
+            broker.cancelOrder(order.getKisOrderNo(), order.getQty() - order.getFilledQty());
+        } catch (KisTransportException e) {
+            throw new ChainIncompleteException("cancel failed for " + order.getKisOrderNo(), e);
+        }
     }
 
     /** 확장 지점(Task 9·10): 거부·모호·전송 실패 재시도가 이 메서드를 감싼다. */
@@ -166,18 +277,21 @@ public class OrderLifecycleService {
 
     /**
      * shares 증감은 currentAttemptQty만(prior는 before에 이미 반영 — 이중 반영 금지),
-     * units 판정은 decisionTotalQty > 0 기준(체인 최종 finalization에서만 갱신 — Task 9),
+     * units 판정은 decisionTotalQty > 0 기준이지만 **체인이 끝나는 호출(chainEnding)에서만**
+     * 반영한다 — 재시도로 이어지는 중간 CANCELLED 커밋(Task 9 attempt 루프)에서도 이 메서드가
+     * 호출되므로, chainEnding 없이 매번 +1 하면 attempt 수만큼 중복 반영된다. 체인당 units 증분은
+     * 정확히 한 번(총 체결 > 0인 경우)이어야 한다.
      * cash = balance.cashBalance().doubleValue()(예수금 절대값 투영). entry_bar_ts는 1차
      * DryRunExecutor와 동일 규칙: BUY로 처음 진입할 때만 새 bar로 세팅, CLEAR는 초기화.
      * units은 DryRunExecutor와 동일하게 BUY→+1, CLEAR(전량 SELL)→0 — multi-unit
      * (max-units-cap까지 누적 ADD_UNIT)을 RiskGate가 게이트하므로 여기서 1로 고정하면 안 된다.
      */
     private PortfolioState applyFill(PortfolioState before, OrderEntity order, ZonedDateTime barTs,
-            long currentAttemptQty, long decisionTotalQty, KisBalance balance) {
+            long currentAttemptQty, long decisionTotalQty, KisBalance balance, boolean chainEnding) {
         boolean isSell = order.getSide() == OrderSide.SELL;
         double signedDelta = isSell ? -currentAttemptQty : currentAttemptQty;
         double newShares = before.shares() + signedDelta;
-        if (decisionTotalQty <= 0) {
+        if (!chainEnding || decisionTotalQty <= 0) {
             return new PortfolioState(before.units(), newShares, balance.cashBalance().doubleValue(),
                     before.entryBarTs());
         }
