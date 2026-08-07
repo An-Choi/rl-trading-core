@@ -33,6 +33,15 @@ public class PortfolioManager {
         return s;
     }
 
+    /**
+     * restore()가 이미 실행되어 메모리 상태가 있는지 — 리뷰 수정(Important):
+     * LiquidationService.resume()처럼 current()를 호출하기 전에 부트 순서를 명시적으로
+     * 검증하려는 호출부를 위한 비-throwing 체크.
+     */
+    public boolean isRestored() {
+        return state.get() != null;
+    }
+
     /** 메모리만 갱신 — DB 반영은 사이클 트랜잭션의 몫, 호출은 커밋 후 (spec §2). */
     public void apply(PortfolioState next) {
         state.set(next);

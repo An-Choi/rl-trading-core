@@ -13,6 +13,8 @@ import com.rltrader.tradingcore.kis.KisTransportException;
 import com.rltrader.tradingcore.ledger.AlertRecorder;
 import com.rltrader.tradingcore.ledger.OrderEntity;
 import com.rltrader.tradingcore.ledger.OrderRepository;
+import com.rltrader.tradingcore.ledger.PortfolioSnapshotEntity;
+import com.rltrader.tradingcore.ledger.PortfolioSnapshotRepository;
 import com.rltrader.tradingcore.predict.ArtifactContext;
 import java.math.BigDecimal;
 import java.time.Clock;
@@ -40,22 +42,34 @@ public class OrderLifecycleService {
     private final OrderProperties props;
     private final Clock clock;
     private final AlertRecorder alerts;
+    private final PortfolioSnapshotRepository snapshots;
 
     public OrderLifecycleService(BrokerPort broker, OrderRepository orders,
             OrderFinalizationService finalization, OrderProperties props, Clock clock,
-            AlertRecorder alerts) {
+            AlertRecorder alerts, PortfolioSnapshotRepository snapshots) {
         this.broker = broker;
         this.orders = orders;
         this.finalization = finalization;
         this.props = props;
         this.clock = clock;
         this.alerts = alerts;
+        this.snapshots = snapshots;
     }
 
     public ChainOutcome runChain(long decisionId, OrderPlan plan, ZonedDateTime barTs,
             PortfolioState before, ArtifactContext ctx) {
         OrderEntity order = orders.findByDecisionIdAndStatus(decisionId, OrderStatus.NEW)
                 .orElseThrow(() -> new IllegalStateException("no NEW intent for decision " + decisionId));
+        // 리뷰 수정(Critical) — 이 체인이 재개된 이월(liquidation) 체인인지 진입 시점에 한 번
+        // 판정해 둔다: 스냅숏의 liquidation_pending이 이미 true라면 LiquidationService.resume()이
+        // 이 decision을 다시 집어 든 것 — 이번 호출 안에서 몇 번을 재시도하든 그 사실은 바뀌지
+        // 않는다(완료 전까지). 중간 CANCELLED→retry 커밋이 이 값을 재확언해야 pendingActive()의
+        // 유일한 스캐너가 크래시 시에도 계속 이 decision을 찾을 수 있다 (finalizeChain은 매
+        // 호출마다 liquidationPending을 무조건 덮어쓰므로, 하드코딩된 false가 아니라 실제 상태를
+        // 넘겨야 한다).
+        boolean liquidationCarried = snapshots.findById(order.getSymbol())
+                .map(PortfolioSnapshotEntity::isLiquidationPending)
+                .orElse(false);
         // attempt 루프 (Task 9): 각 반복 시작 시 prior를 DB에서 재조회한다 — 직전 attempt의
         // finalization이 accounted를 이미 커밋했으므로, 인프로세스 연속 attempt와 재시작 후
         // 재개가 동일 코드 경로가 된다 (in-process/restart 동형성).
@@ -125,8 +139,11 @@ public class OrderLifecycleService {
                 PortfolioState after = applyFill(before, order, barTs, currentAttemptQty, decisionTotalQty,
                         balance, false);
                 OrderEntity nextOrder = newAttempt(order, remaining);
+                // 리뷰 수정(Critical) — liquidationCarried를 재확언한다: 일반 체인은 false 그대로,
+                // 재개된 이월 체인은 true를 다시 커밋해야 pendingActive()가 계속 이 decision을
+                // 찾을 수 있다(완료 전 중간 커밋에서 조용히 꺼지는 것을 방지).
                 finalization.finalizeChain(order, OrderStatus.CANCELLED, confirmed, after,
-                        ChainNext.retry(nextOrder), ctx, TransitionMode.NORMAL);
+                        ChainNext.retry(nextOrder, liquidationCarried), ctx, TransitionMode.NORMAL);
                 order = nextOrder;
                 before = after;
                 continue;

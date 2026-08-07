@@ -243,6 +243,95 @@ class ClearChainAndLiquidationTest extends AbstractIntegrationTest {
         assertThat(liquidation.pendingActive()).isFalse();
     }
 
+    /**
+     * 리뷰 수정(Critical) 커버 테스트 — 재개된 이월 체인의 첫 재개 attempt 자체가 부분체결 후
+     * 타임아웃->취소->재시도(잔량 있음, 아직 EOD 아님)로 이어질 때, 그 중간 finalization이
+     * liquidationPending을 하드코딩된 false로 조용히 꺼버리지 않고 true로 재확언해야 한다 —
+     * 그래야 pendingActive()의 유일한 스캐너가 그 시점에 크래시해도 이 decision을 계속 찾는다.
+     * 최종적으로 체인이 완료되면 그때에서야 플래그가 false가 된다.
+     */
+    @Test
+    void liquidation_resume_intermediate_retry_preserves_liquidation_pending_until_completion() {
+        // 전일 상태: attempt1 CANCELLED(4주 체결, 잔량 6) + liquidationPending=true
+        long d = clearDecisionWithNewOrder(10);
+        OrderEntity attempt1 = orders.findByDecisionIdAndStatus(d, OrderStatus.NEW).orElseThrow();
+        attempt1.setKisOrderNo("0001");
+        attempt1.setStatus(OrderStatus.CANCELLED);
+        attempt1.setFilledQty(4);
+        attempt1.setAccountedFilledQty(4);
+        attempt1.setAvgFillPrice(new BigDecimal("100.0"));
+        attempt1.setAccountedFillNotional(new BigDecimal("400.0"));
+        orders.save(attempt1);
+
+        PortfolioSnapshotEntity snap = new PortfolioSnapshotEntity();
+        snap.setSymbol("005930");
+        snap.setUnits(1);
+        snap.setShares(6.0);
+        snap.setCash(400.00);
+        snap.setEntryBarTs(TestFixtures.bar("2026-08-07T09:10").toOffsetDateTime());
+        snap.setArtifactId(TestFixtures.ctx().artifactId());
+        snap.setUpdatedAt(java.time.OffsetDateTime.now());
+        snap.setLiquidationPending(true);
+        snapshots.save(snap);
+        portfolioManager.apply(new PortfolioState(1, 6.0, 400.00, TestFixtures.bar("2026-08-07T09:10")));
+
+        // 익일 09:00로 clock 전진 (아직 15:30 KST 훨씬 이전 -- EOD 아님)
+        mutableClock().set(Instant.parse("2026-08-08T00:00:00Z")); // 09:00 KST 8/8
+
+        // resume()이 재개하는 attempt2(잔량 6): 2주 체결 후 타임아웃 -> 취소 확정 (잔량 4, EOD
+        // 아님) -> retry -> attempt3(잔량 4) 생성. attempt3 제출 시점에 attempt2의 중간
+        // finalization이 이미 커밋돼 있어야 하므로, attempt3의 submitMarketOrder 호출 시점에
+        // snapshot.liquidationPending이 여전히 true인지 확인한다.
+        when(broker.submitMarketOrder("005930", OrderSide.SELL, 6))
+                .thenReturn(new KisOrderAck("0002"));
+        when(broker.orderSnapshot(eq("0002"), any(LocalDate.class)))
+                .thenAnswer(inv -> {
+                    mutableClock().advance(Duration.ofSeconds(61));
+                    return Optional.of(new KisOrderSnapshot("0002", 6, 2, new BigDecimal("99.0"), false, false));
+                })
+                .thenReturn(Optional.of(new KisOrderSnapshot("0002", 6, 2, new BigDecimal("99.0"), true, true)));
+
+        when(broker.submitMarketOrder("005930", OrderSide.SELL, 4))
+                .thenAnswer(inv -> {
+                    // attempt2의 CANCELLED+retry finalization은 이 시점에 이미 커밋되어 있다
+                    // (동기 호출 체인) -- 여기서 스냅숏을 읽어 중간 상태를 검증한다.
+                    var midChain = snapshots.findById("005930").orElseThrow();
+                    assertThat(midChain.isLiquidationPending())
+                            .as("intermediate retry commit must re-affirm liquidationPending=true")
+                            .isTrue();
+                    assertThat(decisions.findById(d).orElseThrow().getExecutionStatus())
+                            .isEqualTo("IN_PROGRESS");
+                    return new KisOrderAck("0003");
+                });
+        // attempt3: 잔량 4 전량 체결 -> 체인 완료
+        when(broker.orderSnapshot(eq("0003"), any(LocalDate.class)))
+                .thenReturn(Optional.of(new KisOrderSnapshot("0003", 4, 4, new BigDecimal("99.2"), true, false)));
+
+        when(broker.balance())
+                .thenReturn(new KisBalance(4, new BigDecimal("598.00")))    // attempt2 finalization
+                .thenReturn(new KisBalance(0, new BigDecimal("994.80")));   // attempt3 finalization (final)
+
+        assertThat(liquidation.pendingActive()).isTrue();
+
+        ChainOutcome out = liquidation.resume(TestFixtures.bar("2026-08-08T09:00"));
+
+        List<OrderEntity> chain = orders.findAll().stream()
+                .filter(o -> o.getDecisionId() == d).toList();
+        assertThat(chain).hasSize(3);   // attempt1(전일) + attempt2 + attempt3
+        OrderEntity attempt2 = chain.stream().filter(o -> o.getAttempt() == 2).findFirst().orElseThrow();
+        OrderEntity attempt3 = chain.stream().filter(o -> o.getAttempt() == 3).findFirst().orElseThrow();
+        assertThat(attempt2.getStatus()).isEqualTo(OrderStatus.CANCELLED);
+        assertThat(attempt3.getStatus()).isEqualTo(OrderStatus.FILLED);
+
+        // 완료 후에야 플래그가 꺼진다
+        var snapAfter = snapshots.findById("005930").orElseThrow();
+        assertThat(snapAfter.isLiquidationPending()).isFalse();
+        assertThat(decisions.findById(d).orElseThrow().getExecutionStatus()).isEqualTo("COMPLETED");
+        assertThat(out.after().units()).isEqualTo(0);
+        assertThat(out.after().entryBarTs()).isNull();
+        assertThat(liquidation.pendingActive()).isFalse();
+    }
+
     @Test
     void closing_auction_order_waits_until_1535_then_fills() {
         // 15:20 bar 주문: clock 15:25 -- 미체결 스냅숏이어도 취소하지 않고 폴링 지속.
