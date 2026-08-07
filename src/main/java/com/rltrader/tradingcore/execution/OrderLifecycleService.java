@@ -5,9 +5,11 @@ import com.rltrader.tradingcore.domain.OrderSide;
 import com.rltrader.tradingcore.domain.OrderStatus;
 import com.rltrader.tradingcore.domain.PortfolioState;
 import com.rltrader.tradingcore.domain.TradingGrid;
+import com.rltrader.tradingcore.halt.HaltService;
 import com.rltrader.tradingcore.kis.BrokerPort;
 import com.rltrader.tradingcore.kis.KisBalance;
 import com.rltrader.tradingcore.kis.KisOrderAck;
+import com.rltrader.tradingcore.kis.KisOrderRejectedException;
 import com.rltrader.tradingcore.kis.KisOrderSnapshot;
 import com.rltrader.tradingcore.kis.KisTransportException;
 import com.rltrader.tradingcore.ledger.AlertRecorder;
@@ -22,7 +24,10 @@ import java.time.Instant;
 import java.time.LocalTime;
 import java.time.OffsetDateTime;
 import java.time.ZonedDateTime;
+import java.util.HashSet;
+import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import org.springframework.stereotype.Component;
 
 /**
@@ -43,10 +48,11 @@ public class OrderLifecycleService {
     private final Clock clock;
     private final AlertRecorder alerts;
     private final PortfolioSnapshotRepository snapshots;
+    private final HaltService halts;
 
     public OrderLifecycleService(BrokerPort broker, OrderRepository orders,
             OrderFinalizationService finalization, OrderProperties props, Clock clock,
-            AlertRecorder alerts, PortfolioSnapshotRepository snapshots) {
+            AlertRecorder alerts, PortfolioSnapshotRepository snapshots, HaltService halts) {
         this.broker = broker;
         this.orders = orders;
         this.finalization = finalization;
@@ -54,6 +60,7 @@ public class OrderLifecycleService {
         this.clock = clock;
         this.alerts = alerts;
         this.snapshots = snapshots;
+        this.halts = halts;
     }
 
     public ChainOutcome runChain(long decisionId, OrderPlan plan, ZonedDateTime barTs,
@@ -83,12 +90,15 @@ public class OrderLifecycleService {
             final long priorAccountedQty = orders.sumAccountedFilledQtyByDecisionId(decisionId);
             final BigDecimal priorNotional = orders.sumAccountedFillNotionalByDecisionId(decisionId);
 
-            // — 제출 (Task 8 범위: 성공 ack 경로만. 거부·모호는 Task 10이 이 지점을 확장)
-            KisOrderAck ack = submitAttempt(order);
-            finalization.transition(order, OrderStatus.SUBMITTED, Map.of());
-            order.setKisOrderNo(ack.kisOrderNo());
-            order.setSubmittedAt(OffsetDateTime.now(clock));
-            finalization.transition(order, OrderStatus.ACKED, Map.of("kisOrderNo", ack.kisOrderNo()));
+            // — 제출 (Task 11): 거부/미송신/모호 전부를 submitAndAck이 흡수한다. 거부(add 포기)·
+            // 미송신 재실패(ABORTED)는 이 attempt에서 체인이 그대로 끝나므로 terminal outcome을
+            // 즉시 반환한다. SUBMIT_UNKNOWN 채택은 이미 ACKED로 커밋된 상태로 돌아오므로 폴링에
+            // 곧바로 합류한다 — 채택도 미채택(HALT)도 재전송은 하지 않는다.
+            SubmitOutcome submitOutcome = submitAndAck(order, decisionId, barTs, before, ctx);
+            if (submitOutcome.terminal() != null) {
+                return submitOutcome.terminal();
+            }
+            order = submitOutcome.order();
 
             // — 체결 폴링: canonical filled_qty 단조 갱신, terminal 후보 판정만 (terminal 커밋 금지)
             KisOrderSnapshot polled = pollUntilTerminalCandidate(order, deadline(barTs));
@@ -234,9 +244,160 @@ public class OrderLifecycleService {
         }
     }
 
-    /** 확장 지점(Task 9·10): 거부·모호·전송 실패 재시도가 이 메서드를 감싼다. */
-    KisOrderAck submitAttempt(OrderEntity order) {
-        return broker.submitMarketOrder(order.getSymbol(), order.getSide(), order.getQty());
+    /**
+     * 제출 지점의 완전한 분기 (Task 11) — 결과는 셋 중 하나:
+     * 1) 정상 ack: order가 ACKED로 커밋된 채 반환(SubmitOutcome.of) — 호출부는 그대로 폴링에 합류.
+     * 2) terminal: 이 attempt에서 체인이 끝났다 — REJECTED(add) / ABORTED(add) / 거부 상한 도달
+     *    (add는 completed, clear는 이월) — SubmitOutcome.terminal()에 담긴 ChainOutcome을
+     *    runChain이 그대로 반환한다.
+     * 3) SUBMIT_UNKNOWN 채택: resolveSubmitUnknown이 이미 RECOVERY 전이로 ACKED까지 커밋해
+     *    두었으므로 (1)과 동일하게 폴링에 합류한다. 미채택(모호·미발견)은
+     *    ChainIncompleteException을 던져 그대로 전파한다(비종결 유지, 재전송 금지).
+     */
+    private SubmitOutcome submitAndAck(OrderEntity order, long decisionId,
+            ZonedDateTime barTs, PortfolioState before, ArtifactContext ctx) {
+        int rejectAttempts = 0;
+        boolean resent = false;
+        while (true) {
+            try {
+                KisOrderAck ack = broker.submitMarketOrder(order.getSymbol(), order.getSide(), order.getQty());
+                finalization.transition(order, OrderStatus.SUBMITTED, Map.of());
+                order.setKisOrderNo(ack.kisOrderNo());
+                order.setSubmittedAt(OffsetDateTime.now(clock));
+                finalization.transition(order, OrderStatus.ACKED, Map.of("kisOrderNo", ack.kisOrderNo()));
+                return SubmitOutcome.of(order);
+            } catch (KisOrderRejectedException rejected) {
+                rejectAttempts++;
+                boolean upperBoundReached = rejectAttempts >= props.rejectRetryMax();
+                if (order.getSide() == OrderSide.BUY || upperBoundReached) {
+                    return SubmitOutcome.terminal(rejectTerminate(order, decisionId, barTs, before, ctx,
+                            rejected, upperBoundReached));
+                }
+                // clear(SELL): 상한 미도달 — 같은 attempt(같은 kis_order_no 미부여 상태)로 재시도.
+                // NEW 상태 그대로이므로 재시도 자체는 상태 전이가 필요 없다.
+            } catch (KisTransportException transport) {
+                if (transport.requestSent()) {
+                    // 송신 후 불확실 — SUBMIT_UNKNOWN 커밋 후 해소 절차(재전송 금지).
+                    finalization.transition(order, OrderStatus.SUBMIT_UNKNOWN, Map.of());
+                    resolveSubmitUnknown(order);   // 채택 시 SUBMIT_UNKNOWN→ACKED(RECOVERY) + kisOrderNo 저장
+                    return SubmitOutcome.of(order);
+                }
+                // 미송신 확실 — 재전송 1회(NEW 유지, 전이 없음). 두 번째도 미송신 실패면 ABORTED.
+                if (resent) {
+                    return SubmitOutcome.terminal(
+                            abortTerminate(order, decisionId, barTs, before, ctx));
+                }
+                resent = true;
+                // 루프 재진입 = 재전송 시도. rejectAttempts는 그대로 유지(미송신 재시도는 거부 카운트가 아니다).
+            }
+        }
+    }
+
+    /**
+     * 동기 거부 종결 — add(BUY): 즉시 completed(재시도 없음). clear(SELL): rejectRetryMax 상한
+     * 도달 시에만 호출되며 이월(liquidation)로 끝난다. 체결이 없었으므로(zero-fill) 회계·portfolio는
+     * before 그대로 — balance 재조회를 하지 않는다("무변경").
+     */
+    private ChainOutcome rejectTerminate(OrderEntity order, long decisionId, ZonedDateTime barTs,
+            PortfolioState before, ArtifactContext ctx,
+            KisOrderRejectedException rejected, boolean upperBoundReached) {
+        long priorAccountedQty = orders.sumAccountedFilledQtyByDecisionId(decisionId);
+        BigDecimal priorNotional = orders.sumAccountedFillNotionalByDecisionId(decisionId);
+        ChainNext next = order.getSide() == OrderSide.BUY
+                ? ChainNext.markCompleted()
+                : ChainNext.liquidation();
+        finalization.finalizeChain(order, OrderStatus.REJECTED, null, before, next, ctx, TransitionMode.NORMAL);
+        alerts.record("ORDER_REJECTED", barTs, Map.of(
+                "decisionId", decisionId, "rtCd", rejected.rtCd(), "msg", rejected.msg(),
+                "side", order.getSide(), "rejectRetryMaxReached", upperBoundReached));
+        return new ChainOutcome(before, priorNotional, priorAccountedQty, order.getSide() == OrderSide.SELL);
+    }
+
+    /**
+     * 미송신 확실 재실패 종결 — ABORTED는 이 프로세스가 requestSent=false를 직접 관찰한 이
+     * 경로 전용(spec §3, "부재는 증명이 아니다"). add는 completed, clear는 이월.
+     * 송신 자체가 없었으므로 order_events에 SUBMITTED가 남지 않는다(finalizeChain의 동기 거부
+     * 특례는 REJECTED 전용이라 여기 적용되지 않는다 — from=NEW로 직접 ABORTED 이벤트 하나만 기록).
+     */
+    private ChainOutcome abortTerminate(OrderEntity order, long decisionId, ZonedDateTime barTs,
+            PortfolioState before, ArtifactContext ctx) {
+        long priorAccountedQty = orders.sumAccountedFilledQtyByDecisionId(decisionId);
+        BigDecimal priorNotional = orders.sumAccountedFillNotionalByDecisionId(decisionId);
+        ChainNext next = order.getSide() == OrderSide.BUY
+                ? ChainNext.markCompleted()
+                : ChainNext.liquidation();
+        finalization.finalizeChain(order, OrderStatus.ABORTED, null, before, next, ctx, TransitionMode.NORMAL);
+        alerts.record("ORDER_SUBMIT_ABORTED", barTs, Map.of(
+                "decisionId", decisionId, "side", order.getSide()));
+        return new ChainOutcome(before, priorNotional, priorAccountedQty, order.getSide() == OrderSide.SELL);
+    }
+
+    /**
+     * 송신 후 불확실(SUBMIT_UNKNOWN) 해소 절차 (Task 11) — dailyOrders(tradingDate) 반복 조회
+     * (최대 submitUnknownMaxLookups회, 간격 fillPollIntervalMs) → 차집합(로컬 orders가 아는
+     * kis_order_no 제외, 당일) 계산:
+     *   1개 = 채택 — 공유 OrderFinalizationService.transition(RECOVERY)로 SUBMIT_UNKNOWN→ACKED를
+     *         판정+저장(OrderStateMachine 직접 호출 금지) + kis_order_no 저장 후 폴링 합류.
+     *   0개 지속(상한까지) = 불명확 — HaltService.raise + ChainIncompleteException(재전송 금지,
+     *         주문은 SUBMIT_UNKNOWN 비종결 유지).
+     *   2개 이상 = 모호 — 동일하게 HALT(재조회 계속하지 않음).
+     */
+    private void resolveSubmitUnknown(OrderEntity order) {
+        Set<String> known = knownKisOrderNos(order.getTradingDate());
+        for (int lookup = 1; lookup <= props.submitUnknownMaxLookups(); lookup++) {
+            List<KisOrderSnapshot> daily = broker.dailyOrders(order.getTradingDate());
+            List<KisOrderSnapshot> unknown = daily.stream()
+                    .filter(s -> s.kisOrderNo() != null && !known.contains(s.kisOrderNo()))
+                    .toList();
+            if (unknown.size() == 1) {
+                KisOrderSnapshot adopted = unknown.get(0);
+                order.setKisOrderNo(adopted.kisOrderNo());
+                order.setSubmittedAt(OffsetDateTime.now(clock));
+                finalization.transition(order, OrderStatus.ACKED,
+                        Map.of("kisOrderNo", adopted.kisOrderNo(), "adoptedViaSubmitUnknown", true),
+                        TransitionMode.RECOVERY);
+                return;
+            }
+            if (unknown.size() >= 2) {
+                haltSubmitUnknown(order, "ambiguous: " + unknown.size() + " unmatched orders");
+                throw new ChainIncompleteException(
+                        "SUBMIT_UNKNOWN ambiguous for decision " + order.getDecisionId(), null);
+            }
+            if (lookup < props.submitUnknownMaxLookups()) {
+                sleep(props.fillPollIntervalMs());
+            }
+        }
+        haltSubmitUnknown(order, "not found after " + props.submitUnknownMaxLookups() + " lookups");
+        throw new ChainIncompleteException(
+                "SUBMIT_UNKNOWN unresolved for decision " + order.getDecisionId(), null);
+    }
+
+    private void haltSubmitUnknown(OrderEntity order, String reason) {
+        halts.raise("SUBMIT_UNKNOWN", Map.of(
+                "decisionId", order.getDecisionId(), "orderId", order.getId(),
+                "tradingDate", order.getTradingDate().toString(), "reason", reason));
+    }
+
+    /** 당일 로컬 orders가 아는(non-null) kis_order_no 집합 — 차집합의 기준. */
+    private Set<String> knownKisOrderNos(java.time.LocalDate tradingDate) {
+        Set<String> known = new HashSet<>();
+        for (OrderEntity o : orders.findAll()) {
+            if (tradingDate.equals(o.getTradingDate()) && o.getKisOrderNo() != null) {
+                known.add(o.getKisOrderNo());
+            }
+        }
+        return known;
+    }
+
+    /** submitAndAck의 반환 캡슐 — 정상/채택 ack(order) 아니면 terminal ChainOutcome 둘 중 하나만 채워진다. */
+    private record SubmitOutcome(OrderEntity order, ChainOutcome terminal) {
+        static SubmitOutcome of(OrderEntity order) {
+            return new SubmitOutcome(order, null);
+        }
+
+        static SubmitOutcome terminal(ChainOutcome outcome) {
+            return new SubmitOutcome(null, outcome);
+        }
     }
 
     /**
