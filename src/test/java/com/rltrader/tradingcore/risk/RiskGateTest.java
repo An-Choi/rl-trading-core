@@ -47,4 +47,13 @@ class RiskGateTest {
         assertThat(RiskGate.check(TradeAction.HOLD, ALL_TRUE, held, ctx, PROPS)).isEmpty();
         assertThat(RiskGate.check(TradeAction.CLEAR, ALL_TRUE, held, ctx, PROPS)).isEmpty();
     }
+
+    @Test
+    void maskLengthGuardRejectsIncorrectSize() {
+        ArtifactContext ctx = new ArtifactContext("a", 3, 0.199, 10_000.0, 5);
+        PortfolioState state = PortfolioState.flat(10_000.0);
+        // mask 길이 2 — 위반
+        assertThat(RiskGate.check(TradeAction.ADD_UNIT, List.of(true, false), state, ctx, PROPS))
+                .isPresent();
+    }
 }

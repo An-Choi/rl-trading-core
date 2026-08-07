@@ -14,6 +14,10 @@ public final class RiskGate {
 
     public static Optional<String> check(TradeAction action, List<Boolean> mask,
             PortfolioState state, ArtifactContext ctx, TradingProperties props) {
+        if (mask == null || mask.size() != 3) {
+            return Optional.of("action_mask size must be 3, got "
+                    + (mask == null ? "null" : mask.size()));   // 1차 인계 노트: 호출 경로 독립 방어
+        }
         if (!Boolean.TRUE.equals(mask.get(action.index()))) {
             return Optional.of("action " + action + " masked false");
         }
