@@ -16,6 +16,7 @@ import org.springframework.http.client.JdkClientHttpRequestFactory;
 import org.springframework.stereotype.Component;
 import org.springframework.web.client.ResourceAccessException;
 import org.springframework.web.client.RestClient;
+import org.springframework.web.client.RestClientResponseException;
 import tools.jackson.core.JacksonException;
 import tools.jackson.databind.JsonNode;
 import tools.jackson.databind.json.JsonMapper;
@@ -37,6 +38,13 @@ public class KisBrokerClient implements BrokerPort {
         static final String DAILY_CCLD = "VTTC8001R";
         static final String BALANCE = "VTTC8434R";
     }
+
+    private static final String ORDER_SUBMIT_PATH = "/uapi/domestic-stock/v1/trading/order-cash";
+    // 정정취소주문(order-rvsecncl) 엔드포인트 — KIS 문서 재확인 필요. 취소 본문의
+    // RVSE_CNCL_DVSN_CD/KRX_FWDG_ORD_ORGNO/QTY_ALL_ORD_YN 필드값과 ORD_DVSN="00"(시장가 "01"을
+    // 그대로 재사용하지 않음 — 취소는 가격 구분이 무의미하므로 KIS 문서상 통용되는 플레이스홀더
+    // 값으로 "00"을 채택했다)도 전부 미검증 초안이다.
+    private static final String ORDER_CANCEL_PATH = "/uapi/domestic-stock/v1/trading/order-rvsecncl";
 
     private static final DateTimeFormatter DATE_FMT = DateTimeFormatter.BASIC_ISO_DATE;
 
@@ -61,7 +69,7 @@ public class KisBrokerClient implements BrokerPort {
     public KisOrderAck submitMarketOrder(String symbol, OrderSide side, long qty) {
         String trId = (side == OrderSide.BUY) ? TrId.BUY : TrId.SELL;
         Map<String, Object> body = orderBody(symbol, qty);
-        return submitOrder(trId, body);
+        return submitOrder(ORDER_SUBMIT_PATH, trId, body);
     }
 
     @Override
@@ -71,12 +79,12 @@ public class KisBrokerClient implements BrokerPort {
         body.put("ACNT_PRDT_CD", props.accountProductCode());
         body.put("KRX_FWDG_ORD_ORGNO", "");
         body.put("ORGN_ODNO", kisOrderNo);
-        body.put("ORD_DVSN", "01");
+        body.put("ORD_DVSN", "00"); // 취소는 가격 구분 무의미 — 플레이스홀더(재확인 필요)
         body.put("RVSE_CNCL_DVSN_CD", "02"); // 02 = 취소
         body.put("ORD_QTY", String.valueOf(remainingQty));
         body.put("ORD_UNPR", "0");
         body.put("QTY_ALL_ORD_YN", "Y");
-        submitOrder(TrId.CANCEL, body);
+        submitOrder(ORDER_CANCEL_PATH, TrId.CANCEL, body);
     }
 
     private Map<String, Object> orderBody(String symbol, long qty) {
@@ -93,9 +101,10 @@ public class KisBrokerClient implements BrokerPort {
     /**
      * 주문 제출/취소 공통 경로. requestSent는 주문 POST 자체의 전송 실패에서만 판정한다 —
      * hashkey 발급이나 토큰 준비 단계 실패는 주문이 송신된 적이 없으므로 무조건
-     * requestSent=false (SUBMIT_UNKNOWN 오분류 방지).
+     * requestSent=false (SUBMIT_UNKNOWN 오분류 방지). 반대로 주문 POST 자체가 응답을
+     * 받았다면(정상이든 non-2xx든) 요청은 실제로 송신된 것이므로 requestSent=true.
      */
-    private KisOrderAck submitOrder(String trId, Map<String, Object> body) {
+    private KisOrderAck submitOrder(String path, String trId, Map<String, Object> body) {
         String token;
         String hashKey;
         try {
@@ -105,17 +114,22 @@ public class KisBrokerClient implements BrokerPort {
             throw new KisTransportException(e.getMessage(), false, e.getCause());
         } catch (ResourceAccessException e) {
             throw new KisTransportException("hashkey issue failed", false, e);
+        } catch (RestClientResponseException e) {
+            throw new KisTransportException("hashkey request rejected: " + e.getStatusCode(), false, e);
         }
 
         JsonNode response;
         try {
-            String raw = rest.post().uri("/uapi/domestic-stock/v1/trading/order-cash")
+            String raw = rest.post().uri(path)
                     .headers(h -> orderHeaders(h, token, trId, hashKey))
                     .body(body)
                     .retrieve().body(String.class);
             response = parse(raw);
         } catch (ResourceAccessException e) {
             throw new KisTransportException("order submit failed", !KisTokenManager.isConnectFailure(e), e);
+        } catch (RestClientResponseException e) {
+            // 응답을 받았다는 것은 요청이 실제로 송신되었다는 뜻 — requestSent=true.
+            throw new KisTransportException("order submit rejected: " + e.getStatusCode(), true, e);
         }
         return ackFrom(response);
     }
@@ -228,13 +242,23 @@ public class KisBrokerClient implements BrokerPort {
         return new KisOrderSnapshot(odno, orderQty, filledQty, avgPrice, brokerTerminal, cancelled);
     }
 
-    /** 조회(GET) 공통 경로 — 401이면 토큰 무효화 후 1회 재시도. 주문 POST는 재시도하지 않는다. */
+    /**
+     * 조회(GET) 공통 경로 — 401이면 토큰 무효화 후 1회 재시도. 주문 POST는 재시도하지 않는다.
+     * 재시도 후에도 401이면 내부 전용 Unauthorized를 그대로 흘리지 않고 의미있는 메시지의
+     * KisTransportException으로 감싼다 — 응답을 받았다는 것은 요청이 송신되었다는 뜻이므로
+     * requestSent=true.
+     */
     private RawResponse queryWithRetry(java.util.function.Supplier<RawResponse> call) {
         try {
             return callOnce(call);
-        } catch (Unauthorized e) {
+        } catch (Unauthorized first) {
             tokenManager.invalidate();
-            return callOnce(call);
+            try {
+                return callOnce(call);
+            } catch (Unauthorized second) {
+                throw new KisTransportException(
+                        "KIS query rejected with 401 after token invalidate+retry", true, second);
+            }
         }
     }
 

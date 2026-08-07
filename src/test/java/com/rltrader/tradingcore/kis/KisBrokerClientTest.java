@@ -97,4 +97,77 @@ class KisBrokerClientTest {
                 .isInstanceOf(KisTransportException.class)
                 .satisfies(e -> assertThat(((KisTransportException) e).requestSent()).isFalse());
     }
+
+    // 리뷰 finding 1: hashkey가 non-2xx(HTTP 오류 상태)를 반환하면 .retrieve()가
+    // RestClientResponseException을 던진다 — 이 경로도 hashkey 실패이므로 requestSent=false.
+    @Test
+    void hashkey_http_error_status_is_request_not_sent() {
+        wm.stubFor(post(urlEqualTo("/uapi/hashkey"))
+                .willReturn(aResponse().withStatus(500).withBody("boom")));
+        assertThatThrownBy(() -> client.submitMarketOrder("005930", OrderSide.BUY, 10))
+                .isInstanceOf(KisTransportException.class)
+                .satisfies(e -> assertThat(((KisTransportException) e).requestSent()).isFalse());
+    }
+
+    // 리뷰 finding 1: 주문 POST 자체가 non-2xx를 반환하면 — 응답을 받았다는 것은 요청이
+    // 실제로 송신되었다는 뜻이므로 requestSent=true.
+    @Test
+    void order_post_http_error_status_is_request_sent() {
+        wm.stubFor(post(urlEqualTo("/uapi/domestic-stock/v1/trading/order-cash"))
+                .willReturn(aResponse().withStatus(500).withBody("boom")));
+        assertThatThrownBy(() -> client.submitMarketOrder("005930", OrderSide.BUY, 10))
+                .isInstanceOf(KisTransportException.class)
+                .satisfies(e -> assertThat(((KisTransportException) e).requestSent()).isTrue());
+    }
+
+    @Test
+    void cancel_order_sends_expected_body_and_succeeds() {
+        wm.stubFor(post(urlEqualTo("/uapi/domestic-stock/v1/trading/order-rvsecncl"))
+                .withHeader("tr_id", equalTo("VTTC0803U"))
+                .willReturn(okJson("{\"rt_cd\":\"0\",\"output\":{\"ODNO\":\"0000099999\"}}")));
+        client.cancelOrder("0000012345", 5);
+        wm.verify(postRequestedFor(urlEqualTo("/uapi/domestic-stock/v1/trading/order-rvsecncl"))
+                .withRequestBody(matchingJsonPath("$.ORGN_ODNO", equalTo("0000012345")))
+                .withRequestBody(matchingJsonPath("$.RVSE_CNCL_DVSN_CD", equalTo("02")))
+                .withRequestBody(matchingJsonPath("$.ORD_QTY", equalTo("5")))
+                .withRequestBody(matchingJsonPath("$.ORD_DVSN", equalTo("00"))));
+    }
+
+    @Test
+    void cancel_order_rejection_raises_typed_exception() {
+        wm.stubFor(post(urlEqualTo("/uapi/domestic-stock/v1/trading/order-rvsecncl"))
+                .willReturn(okJson("{\"rt_cd\":\"1\",\"msg_cd\":\"40250099\",\"msg1\":\"취소 불가\"}")));
+        assertThatThrownBy(() -> client.cancelOrder("0000012345", 5))
+                .isInstanceOf(KisOrderRejectedException.class);
+    }
+
+    // 리뷰 finding 4: 조회 401 -> invalidate() -> 재시도 성공 (1회만 재시도되는지 확인).
+    @Test
+    void query_retries_once_after_401_then_succeeds() {
+        wm.stubFor(get(urlPathEqualTo("/uapi/domestic-stock/v1/trading/inquire-balance"))
+                .inScenario("auth").whenScenarioStateIs(com.github.tomakehurst.wiremock.stubbing.Scenario.STARTED)
+                .willReturn(aResponse().withStatus(401))
+                .willSetStateTo("retried"));
+        wm.stubFor(get(urlPathEqualTo("/uapi/domestic-stock/v1/trading/inquire-balance"))
+                .inScenario("auth").whenScenarioStateIs("retried")
+                .willReturn(okJson("""
+                    {"rt_cd":"0",
+                     "output1":[{"pdno":"005930","hldg_qty":"15"}],
+                     "output2":[{"dnca_tot_amt":"9876543.00"}]}""")));
+        KisBalance b = client.balance();
+        assertThat(b.holdingQty()).isEqualTo(15L);
+        wm.verify(2, getRequestedFor(urlPathEqualTo("/uapi/domestic-stock/v1/trading/inquire-balance")));
+    }
+
+    // 리뷰 finding 2: 재시도 후에도 401이면 내부 private Unauthorized가 새어나가지 않고
+    // 의미있는 메시지의 KisTransportException(requestSent=true)으로 감싸져야 한다.
+    @Test
+    void query_persistent_401_raises_typed_transport_exception() {
+        wm.stubFor(get(urlPathEqualTo("/uapi/domestic-stock/v1/trading/inquire-balance"))
+                .willReturn(aResponse().withStatus(401)));
+        assertThatThrownBy(() -> client.balance())
+                .isInstanceOf(KisTransportException.class)
+                .satisfies(e -> assertThat(((KisTransportException) e).requestSent()).isTrue());
+        wm.verify(2, getRequestedFor(urlPathEqualTo("/uapi/domestic-stock/v1/trading/inquire-balance")));
+    }
 }
