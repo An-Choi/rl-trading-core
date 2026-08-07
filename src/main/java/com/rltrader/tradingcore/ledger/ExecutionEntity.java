@@ -73,8 +73,8 @@ public class ExecutionEntity {
         this.fillPrice = BigDecimal.valueOf(fillPrice);
     }
 
-    public double getSharesDelta() {
-        return sharesDelta != null ? sharesDelta.doubleValue() : 0.0;
+    public BigDecimal getSharesDelta() {
+        return sharesDelta;
     }
 
     public void setSharesDelta(double sharesDelta) {
