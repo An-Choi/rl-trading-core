@@ -37,6 +37,7 @@ class DecisionCycleIntegrationTest extends AbstractIntegrationTest {
     @Autowired AlertRepository alerts;
     @Autowired PortfolioSnapshotRepository snapshots;
     @Autowired AlertRecorder alertRecorder;
+    @Autowired HaltRepository halts;
 
     static final ZonedDateTime BAR =
             ZonedDateTime.parse("2026-08-06T11:00:00+09:00[Asia/Seoul]");
@@ -148,6 +149,10 @@ class DecisionCycleIntegrationTest extends AbstractIntegrationTest {
         assertThat(outcome).isEqualTo(CycleOutcome.HALTED);
         assertThat(cycle.isHalted()).isTrue();
         assertThat(alerts.findAll()).anyMatch(a -> a.getCode().equals("ARTIFACT_CHANGED"));
+        // 재시작-해제형 pin: ARTIFACT_CHANGED는 HaltService.raise를 거치지 않으므로 halts
+        // 테이블에는 아무 행도 남지 않아야 한다 — 이 값이 0이 아니게 되면 누군가 이 경로를
+        // 영속 HALT로 잘못 재배선한 것 (TradingHaltState Javadoc 계약 위반)
+        assertThat(halts.count()).isZero();
     }
 
     @Test

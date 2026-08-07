@@ -113,9 +113,14 @@ public class DecisionCycleService {
             var v = violation.get();
             alerts.record(v.alertCode(), scheduledBar, Map.of("reason", v.reason()));
             if (v.alertCode().equals("ARTIFACT_CHANGED")) {
-                // 캐시된 env_params가 낡음 — 신규 결정 전면 중단 (spec §2). TradingHaltState로
-                // 이관(Task 12) — halts 테이블에는 미기록이라 재시작하면 풀리는 재시작-해제형
-                // 의미는 그대로다(HaltService.raise의 영속 HALT와는 별개, 콜백 배선 없음).
+                // 캐시된 env_params가 낡음 — 신규 결정 전면 중단 (spec §2). haltState.halt()를
+                // HaltService.raise를 거치지 않고 직접 호출한다 — 이 프로세스 안에서는 여전히
+                // 되돌릴 수 없지만, halts 테이블에는 의도적으로 기록하지 않는다: 재시작(새 JVM)
+                // 은 TradingHaltState 빈을 새로 만들므로 halted=false로 다시 시작한다("재시작-
+                // 해제형"). HaltService.raise가 만드는 halts 행 기반 영속 HALT(재시작해도 유지,
+                // 수동 clear 필요)와는 의도적으로 다른 종류 — 콜백 배선도 없다(Task 7 순환 의존
+                // 차단). 두 종류의 구분은 TradingHaltState의 플래그가 아니라 halts 테이블
+                // 존재 여부로만 이루어진다(TradingHaltState Javadoc 참고).
                 haltState.halt();
                 return CycleOutcome.HALTED;
             }
