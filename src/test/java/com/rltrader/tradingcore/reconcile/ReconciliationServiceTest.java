@@ -21,6 +21,7 @@ import com.rltrader.tradingcore.scheduler.CycleAdmissionGate;
 import java.math.BigDecimal;
 import java.time.LocalDate;
 import java.time.OffsetDateTime;
+import java.time.ZonedDateTime;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -126,16 +127,26 @@ class ReconciliationServiceTest extends AbstractIntegrationTest {
     }
 
     private void seedSnapshot(int units, double shares, double cash) {
+        seedSnapshot(units, shares, cash, null);
+    }
+
+    /**
+     * entryBarTs를 실제로 세팅 가능한 변형 — SELL 체인 종료(chain-end)의 units=0/entryBarTs=null
+     * "무조건 리셋" 회귀 테스트는 리셋 전 상태가 0/null이 아니어야 리셋이 실제로 일어났음을
+     * 증명한다(round 3 리뷰 수정 covering test).
+     */
+    private void seedSnapshot(int units, double shares, double cash, ZonedDateTime entryBarTs) {
         PortfolioSnapshotEntity s = new PortfolioSnapshotEntity();
         s.setSymbol(SYMBOL);
         s.setUnits(units);
         s.setShares(shares);
         s.setCash(cash);
         s.setArtifactId(CTX.artifactId());
+        s.setEntryBarTs(entryBarTs != null ? entryBarTs.toOffsetDateTime() : null);
         s.setUpdatedAt(OffsetDateTime.now());
         s.setLiquidationPending(false);
         snapshots.save(s);
-        portfolio.apply(new PortfolioState(units, shares, cash, null));
+        portfolio.apply(new PortfolioState(units, shares, cash, entryBarTs));
     }
 
     private List<Map<String, Object>> reconRows(String level) {
@@ -299,6 +310,74 @@ class ReconciliationServiceTest extends AbstractIntegrationTest {
         assertThat(((Number) order.get("accounted_filled_qty")).longValue()).isEqualTo(3L);
 
         assertThat(alertRepo.findAll()).anySatisfy(a -> assertThat(a.getCode()).isEqualTo("PARTIAL_UNIT"));
+    }
+
+    /**
+     * Important 리뷰 수정(round 3) — OrderLifecycleService.applyFill의 chain-end 3분기 중
+     * "SELL chain-end → units=0·entryBarTs=null 무조건 리셋"이 applyObservedFill에 빠져 있었다.
+     * ghost-fill 경로(finalizeObservedFill, filled_qty==qty)로 관찰된 SELL 전량 체결도 정상 체결
+     * 경로와 동일하게 리셋돼야 한다 — 리셋 전 상태를 units=1·entryBarTs 세팅으로 준비해 실제로
+     * 리셋이 일어났음을 증명한다(0/null로 시작하면 안 바뀌어도 통과하므로 무의미).
+     */
+    @Test
+    void observed_full_sell_fill_resets_units_and_entry_bar_ts() {
+        long d = insertDecision();
+        ZonedDateTime staleEntry = ZonedDateTime.parse("2026-08-01T02:00:00Z");
+        long orderId = insertOpenSellOrder(d, "K001F", 10);
+        seedSnapshot(1, 10.0, 9_000.0, staleEntry);   // before: units=1, entryBarTs 세팅됨(청산 전 보유 중)
+
+        when(broker.orderSnapshot(eq("K001F"), any(LocalDate.class)))
+                .thenReturn(Optional.of(new KisOrderSnapshot("K001F", 10, 10, new BigDecimal("100.0"), true, false)));
+        when(broker.balance()).thenReturn(new KisBalance(0, new BigDecimal("10000.00")));
+
+        recon.reconcile(Trigger.PERIODIC);
+
+        Map<String, Object> order = jdbc.queryForMap("SELECT * FROM orders WHERE id = ?", orderId);
+        assertThat(order.get("status")).isEqualTo("FILLED");
+
+        assertThat(portfolio.current().units()).isEqualTo(0);
+        assertThat(portfolio.current().entryBarTs()).isNull();
+        PortfolioSnapshotEntity snap = snapshots.findById(SYMBOL).orElseThrow();
+        assertThat(snap.getUnits()).isEqualTo(0);
+        assertThat(snap.getEntryBarTs()).isNull();
+    }
+
+    /**
+     * Important 리뷰 수정(round 3), 코드 경로 도달성 확인 — finalizeObservedTerminalRemainder는
+     * reconcileOrders의 fullyFilled==false 분기에서만 호출되므로, 이 메서드에 도달한 SELL은
+     * remaining(=qty−filled)이 항상 > 0이다(filled==qty였다면 fullyFilled 분기가 먼저
+     * finalizeObservedFill로 보냈을 것 — "전량 소진" SELL이 이 메서드의 markCompleted 분기에
+     * 도달하는 경로는 코드상 존재하지 않는다, 위 finalizeObservedTerminalRemainder javadoc 참고).
+     * 그래서 SELL이 이 메서드를 타면 항상 이월(ChainEnd.NOT_ENDING) — units/entryBarTs가
+     * "보존"돼야 정상이다(SELL_CLOSE 리셋은 반대로 적용되면 안 됨). 이 테스트는 그 보존을
+     * 검증해 SELL_CLOSE 리셋 로직이 이월 분기로 잘못 새지 않았음을 확인한다 — 브리프가 요청한
+     * "fully-drained remainder variant"는 이 메서드 안에서는 SELL에 대해 존재하지 않는 상태이므로,
+     * 대신 그 경계(remaining>0에서는 절대 리셋되지 않음)를 회귀 방어로 남긴다.
+     */
+    @Test
+    void observed_sell_terminal_remainder_preserves_units_not_sell_close() {
+        long d = insertDecision();
+        ZonedDateTime staleEntry = ZonedDateTime.parse("2026-08-01T02:00:00Z");
+        jdbc.update("UPDATE decisions SET execution_status = 'IN_PROGRESS' WHERE id = ?", d);
+        long orderId = insertOpenSellOrder(d, "K001R", 10);
+        seedSnapshot(1, 10.0, 9_000.0, staleEntry);
+
+        // brokerTerminal=true, cancelled=true, filled=6/10(잔량 4) — 진짜 취소 확정, 잔량 있음.
+        when(broker.orderSnapshot(eq("K001R"), any(LocalDate.class)))
+                .thenReturn(Optional.of(new KisOrderSnapshot("K001R", 10, 6, new BigDecimal("100.0"), true, true)));
+        when(broker.balance()).thenReturn(new KisBalance(4, new BigDecimal("9600.00")));
+
+        recon.reconcile(Trigger.PERIODIC);
+
+        Map<String, Object> order = jdbc.queryForMap("SELECT * FROM orders WHERE id = ?", orderId);
+        assertThat(order.get("status")).isEqualTo("CANCELLED");   // 이월 — FILLED 아님
+
+        // ChainEnd.NOT_ENDING — units/entryBarTs는 seedSnapshot이 세팅한 이전 값 그대로 보존.
+        assertThat(portfolio.current().units()).isEqualTo(1);
+        assertThat(portfolio.current().entryBarTs()).isEqualTo(staleEntry);
+        PortfolioSnapshotEntity snap = snapshots.findById(SYMBOL).orElseThrow();
+        assertThat(snap.getUnits()).isEqualTo(1);
+        assertThat(snap.getEntryBarTs()).isEqualTo(staleEntry.toOffsetDateTime());
     }
 
     // ---------------------------------------------------------------- 시나리오 2

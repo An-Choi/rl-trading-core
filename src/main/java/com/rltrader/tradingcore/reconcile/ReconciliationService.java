@@ -193,9 +193,9 @@ public class ReconciliationService {
     /**
      * 관찰 점프(FILLED, filled_qty == qty) — 공유 finalization 경로, RECOVERY 모드(spec §6
      * Interfaces 블록). FILLED는 체인이 항상 끝나는 경우이므로 OrderLifecycleService.finalizeFilled와
-     * 동일하게 BUY는 units +1(첫 진입 시 entryBarTs는 decision의 원 bar_ts) — 리뷰 수정: 이전엔
-     * units를 전혀 건드리지 않아, 대사가 관찰한 ghost fill이 정상 체결 경로와 다른 포트폴리오
-     * 상태로 이어지는 회귀가 있었다.
+     * 동일하게 chain-end 3분기(BUY→units+1, SELL→units=0·entryBarTs=null)를 그대로 적용한다 —
+     * 리뷰 수정: 이전엔 units를 전혀 건드리지 않아, 대사가 관찰한 ghost fill이 정상 체결 경로와
+     * 다른 포트폴리오 상태로 이어지는 회귀가 있었다.
      */
     private void finalizeObservedFill(OrderEntity order, KisOrderSnapshot snap) {
         KisBalance balance = balanceOrNull();
@@ -203,7 +203,7 @@ public class ReconciliationService {
             return;   // 잔고 확정 실패 — 이번 회차는 건너뛰고 비종결 유지 (다음 대사가 재시도)
         }
         long delta = snap.cumulativeFilledQty() - order.getAccountedFilledQty();
-        PortfolioState after = applyObservedFill(order, delta, balance, order.getSide() == OrderSide.BUY);
+        PortfolioState after = applyObservedFill(order, delta, balance, ChainEnd.of(order));
         // RECOVERY 모드에서 ctx는 finalizeChain 내부에서 절대 역참조되지 않는다
         // (OrderFinalizationService.saveSnapshot의 RECOVERY 분기는 기존 snapshot의 artifact_id를
         // 보존하거나 decision의 artifact_id로 대체한다 — ctx.artifactId() 호출 경로는 NORMAL 전용).
@@ -214,16 +214,22 @@ public class ReconciliationService {
     /**
      * 관찰 점프(종결·잔량 있음) — brokerTerminal이지만 filled_qty == qty가 아닌 모든 경우
      * (명시적 취소 확정뿐 아니라 IOC/FOK 등 브로커가 잔량을 남긴 채 더 이상 진행하지 않는 경우도
-     * 포함, Important 리뷰 수정). OrderLifecycleService의 체인 종료 분기(§9~10)와 동일한 side별
-     * give-up 시맨틱을 대사 경로에서도 재현한다(Critical 리뷰 수정):
+     * 포함, Important 리뷰 수정). 이 메서드는 reconcileOrders의 fullyFilled==false 분기에서만
+     * 호출되므로 remaining(=qty−filled)은 side와 무관하게 항상 > 0이다. OrderLifecycleService의
+     * 체인 종료 분기(§9~10)와 동일한 side별 give-up 시맨틱을 대사 경로에서도 재현한다(Critical
+     * 리뷰 수정):
      *
      * <ul>
-     *   <li>SELL + 잔량 > 0: 이월(liquidation) — ChainNext.liquidation()으로 liquidationPending=true,
-     *       execution_status는 IN_PROGRESS 유지. LiquidationService.resume()이 다음 세션에 재개.</li>
-     *   <li>BUY + 잔량(무관, 항상) 또는 SELL 전량 소진: 체인 종료(add 포기/clear 완료) —
-     *       ChainNext.markCompleted() + decisionTotalQty 기준 PARTIAL_UNIT/EXECUTION_FAILED 알림,
-     *       decisionTotalQty > 0이면 units +1(첫 진입 시 entryBarTs를 decision의 원 bar_ts로 세팅 —
-     *       OrderLifecycleService.applyFill과 동일 규칙, 과거 bar로 재진입 판정하지 않는다).</li>
+     *   <li>SELL(잔량은 항상 > 0): 이월(liquidation) — ChainNext.liquidation()으로
+     *       liquidationPending=true, execution_status는 IN_PROGRESS 유지, units/entryBarTs는
+     *       보존(ChainEnd.NOT_ENDING — 체인이 끝나지 않았다). LiquidationService.resume()이
+     *       다음 세션에 재개. SELL이 여기서 "전량 소진"으로 체인을 끝내는 경로는 존재하지 않는다
+     *       — filled==qty였다면 fullyFilled 분기가 먼저 finalizeObservedFill(FILLED)로 보냈을
+     *       것이다(그 경로의 SELL 처리는 ChainEnd.SELL_CLOSE로 별도 커버).</li>
+     *   <li>BUY(잔량 무관, 항상 여기서 체인 종료): add 포기 — ChainNext.markCompleted() +
+     *       decisionTotalQty 기준 PARTIAL_UNIT/EXECUTION_FAILED 알림, decisionTotalQty > 0이면
+     *       units +1(첫 진입 시 entryBarTs를 decision의 원 bar_ts로 세팅 — OrderLifecycleService.
+     *       applyFill과 동일 규칙, 과거 bar로 재진입 판정하지 않는다).</li>
      * </ul>
      *
      * decisionTotalQty는 OrderLifecycleService와 동일하게 OrderRepository.sumAccountedFilledQtyByDecisionId
@@ -241,17 +247,23 @@ public class ReconciliationService {
         long decisionTotalQty = orders.sumAccountedFilledQtyByDecisionId(order.getDecisionId())
                 - order.getAccountedFilledQty() + snap.cumulativeFilledQty();
 
-        if (order.getSide() == OrderSide.SELL && remaining > 0) {
-            PortfolioState after = applyObservedFill(order, delta, balance, false);
+        if (order.getSide() == OrderSide.SELL) {
+            // 이 메서드는 fullyFilled(filled_qty == qty)가 아닐 때만 호출된다(reconcileOrders) —
+            // 즉 remaining = qty - filled_qty는 이 지점에서 항상 > 0이다(SELL이 remaining == 0으로
+            // 도달할 방법이 없다: filled == qty였다면 fullyFilled 분기가 먼저 finalizeObservedFill로
+            // 보냈을 것이다). 그래서 SELL은 여기서 무조건 이월(liquidation) — 체인이 끝나지 않는다.
+            PortfolioState after = applyObservedFill(order, delta, balance, ChainEnd.NOT_ENDING);
             finalization.finalizeChain(order, OrderStatus.CANCELLED, snap, after,
                     ChainNext.liquidation(), null, TransitionMode.RECOVERY);
             return;
         }
 
-        // 이 지점 도달 = 체인 종료(BUY는 항상, SELL은 remaining<=0로 전량 소진). units +1은
-        // BUY이고 decisionTotalQty > 0(체인 전체에 걸쳐 조금이라도 체결이 있었음)일 때만.
-        boolean bumpUnit = order.getSide() == OrderSide.BUY && decisionTotalQty > 0;
-        PortfolioState after = applyObservedFill(order, delta, balance, bumpUnit);
+        // 이 지점 도달 = BUY 체인 종료(add 포기, 잔량 유무 무관 — 재시도는 정상 경로 전담).
+        // decisionTotalQty > 0(체인 전체에 걸쳐 조금이라도 체결이 있었음)일 때만 units+1 — 0이면
+        // (완전 포기) chain-end지만 진입 판정 자체가 성립하지 않으므로 NOT_ENDING과 동일하게 취급
+        // (OrderLifecycleService.applyFill의 decisionTotalQty<=0 조기 반환과 동일 규칙).
+        ChainEnd chainEnd = decisionTotalQty > 0 ? ChainEnd.BUY_ENTRY : ChainEnd.NOT_ENDING;
+        PortfolioState after = applyObservedFill(order, delta, balance, chainEnd);
         finalization.finalizeChain(order, OrderStatus.CANCELLED, snap, after,
                 ChainNext.markCompleted(), null, TransitionMode.RECOVERY);
 
@@ -274,22 +286,45 @@ public class ReconciliationService {
     }
 
     /**
-     * bumpUnitOnBuyChainEnd: BUY 체인이 이번 호출로 끝나고(decisionTotalQty > 0) units를 +1 해야
-     * 하는 경우에만 true — OrderLifecycleService.applyFill의 chainEnding && !isSell 분기와 동일
-     * 규칙(첫 진입이면 entryBarTs를 decision의 원 bar_ts로 세팅, 아니면 기존 유지).
+     * OrderLifecycleService.applyFill의 chainEnding 3분기를 그대로 재현하는 열거값 — 리뷰 수정
+     * (Important, round 3): 이전엔 "BUY chain-end → units+1"만 재현하고 "SELL chain-end → units=0
+     * ·entryBarTs=null(무조건 리셋)"이 빠져 있었다. applyFill과 동일한 이름의 분기를 여기 열거값
+     * 이름에 그대로 반영해 두 구현이 나중에 다시 벌어지지 않게 한다(공유 헬퍼로 완전히 합치지 않은
+     * 이유는 OrderLifecycleService.applyFill이 barTs/currentAttemptQty 등 대사에는 없는 인자에
+     * 의존해 시그니처를 공유하기 어렵기 때문 — 대신 이 3-state 규칙만 별도로 추출해 양쪽이 같은
+     * 이름의 분기를 갖도록 맞췄다. fix report에 이 선택 이유를 기록).
      */
+    private enum ChainEnd {
+        /** 체인이 이번 호출로 끝나지 않음(중간 이월 등) — units/entryBarTs 완전 보존. */
+        NOT_ENDING,
+        /** BUY 체인 종료, 첫 진입이면 entryBarTs를 decision 원 bar_ts로 세팅 — units +1. */
+        BUY_ENTRY,
+        /** SELL 체인 종료(전량 청산) — units=0, entryBarTs=null 무조건 리셋(OrderLifecycleService.
+         *  applyFill의 isSell && chainEnding 분기와 동일, deltaQty·decisionTotalQty와 무관). */
+        SELL_CLOSE;
+
+        /** FILLED 관찰(항상 체인 종료)의 side별 매핑 — BUY_ENTRY/SELL_CLOSE 둘 중 하나. */
+        static ChainEnd of(OrderEntity order) {
+            return order.getSide() == OrderSide.BUY ? BUY_ENTRY : SELL_CLOSE;
+        }
+    }
+
     private PortfolioState applyObservedFill(OrderEntity order, long deltaQty, KisBalance balance,
-            boolean bumpUnitOnBuyChainEnd) {
+            ChainEnd chainEnd) {
         PortfolioState before = portfolio.current();
         double signedDelta = deltaQty <= 0 ? 0
                 : (order.getSide() == OrderSide.SELL ? -deltaQty : deltaQty);
         double newShares = before.shares() + signedDelta;
         double cash = balance.cashBalance().doubleValue();
-        if (!bumpUnitOnBuyChainEnd) {
-            return new PortfolioState(before.units(), newShares, cash, before.entryBarTs());
-        }
-        ZonedDateTime entry = before.units() == 0 ? decisionBarTs(order.getDecisionId()) : before.entryBarTs();
-        return new PortfolioState(before.units() + 1, newShares, cash, entry);
+        return switch (chainEnd) {
+            case NOT_ENDING -> new PortfolioState(before.units(), newShares, cash, before.entryBarTs());
+            case SELL_CLOSE -> new PortfolioState(0, newShares, cash, null);
+            case BUY_ENTRY -> {
+                ZonedDateTime entry = before.units() == 0
+                        ? decisionBarTs(order.getDecisionId()) : before.entryBarTs();
+                yield new PortfolioState(before.units() + 1, newShares, cash, entry);
+            }
+        };
     }
 
     private KisBalance balanceOrNull() {
