@@ -47,6 +47,6 @@ public class KisOrderExecutor implements ExecutionPort {
                         java.math.MathContext.DECIMAL64).doubleValue()
                 : barClose;
         double sharesDelta = outcome.after().shares() - before.shares();
-        return new FillResult(outcome.after(), fillPrice, sharesDelta);
+        return new FillResult(outcome.after(), fillPrice, sharesDelta, outcome.hadTimeout());
     }
 }

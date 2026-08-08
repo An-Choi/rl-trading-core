@@ -111,7 +111,7 @@ public class OrderLifecycleService {
                     && (polled.cumulativeFilledQty() >= order.getQty() || (polled.brokerTerminal() && !polled.cancelled()));
             if (filledCandidate) {
                 ChainOutcome outcome = confirmAndFinalizeFilled(order, barTs, before, ctx,
-                        priorAccountedQty, priorNotional);
+                        priorAccountedQty, priorNotional, hadTimeout);
                 if (outcome != null) {
                     return outcome;
                 }
@@ -197,14 +197,19 @@ public class OrderLifecycleService {
      * 폴링이 terminalCandidate(전량 체결 또는 브로커 종결·미취소)로 판단했을 때의 확정 경로.
      * 확정 조회가 실제로 전량 체결을 반환하면 finalize(FILLED)하고 결과를 반환한다. 그렇지 않으면
      * (드묾 — 폴링 스냅숏과 확정 조회 사이 괴리) null을 반환해 호출부가 취소 경로로 폴백한다.
+     * hadTimeout은 호출부(루프)가 이전 attempt에서 누적한 값을 그대로 넘겨받아 ChainOutcome에
+     * 실어야 한다 — 이 attempt 자체는 타임아웃 없이 바로 체결됐더라도, 직전 attempt가 취소
+     * 경로를 거쳤다면 체인 전체 관점에서는 여전히 true (리뷰 수정 — 이전엔 이 경로가 항상 false를
+     * 하드코딩해 재시도 후 체결로 끝나는 체인의 hadTimeout이 유실됐다).
      */
     private ChainOutcome confirmAndFinalizeFilled(OrderEntity order, ZonedDateTime barTs,
-            PortfolioState before, ArtifactContext ctx, long priorAccountedQty, BigDecimal priorNotional) {
+            PortfolioState before, ArtifactContext ctx, long priorAccountedQty, BigDecimal priorNotional,
+            boolean hadTimeout) {
         KisOrderSnapshot confirmed = confirmOrThrow(order);
         if (confirmed.cumulativeFilledQty() < order.getQty()) {
             return null;
         }
-        return finalizeFilled(order, confirmed, barTs, before, ctx, priorAccountedQty, priorNotional, false);
+        return finalizeFilled(order, confirmed, barTs, before, ctx, priorAccountedQty, priorNotional, hadTimeout);
     }
 
     private ChainOutcome finalizeFilled(OrderEntity order, KisOrderSnapshot confirmed, ZonedDateTime barTs,

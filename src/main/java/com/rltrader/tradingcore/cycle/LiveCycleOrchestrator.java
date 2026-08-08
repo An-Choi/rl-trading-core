@@ -7,6 +7,7 @@ import com.rltrader.tradingcore.domain.TradeAction;
 import com.rltrader.tradingcore.domain.TradingGrid;
 import com.rltrader.tradingcore.execution.ChainIncompleteException;
 import com.rltrader.tradingcore.execution.ExecutionPort;
+import com.rltrader.tradingcore.execution.FillResult;
 import com.rltrader.tradingcore.execution.OrderPlan;
 import com.rltrader.tradingcore.execution.OrderPlanner;
 import com.rltrader.tradingcore.ledger.AlertRecorder;
@@ -16,11 +17,14 @@ import com.rltrader.tradingcore.ledger.OrderEntity;
 import com.rltrader.tradingcore.ledger.OrderRepository;
 import com.rltrader.tradingcore.predict.ArtifactContext;
 import com.rltrader.tradingcore.predict.PredictResponse;
+import com.rltrader.tradingcore.reconcile.ReconciliationService;
+import com.rltrader.tradingcore.reconcile.Trigger;
 import java.math.BigDecimal;
 import java.util.Map;
 import java.util.Optional;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.context.annotation.Profile;
 import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.stereotype.Component;
@@ -52,10 +56,12 @@ public class LiveCycleOrchestrator {
     private final TransactionTemplate tx;
     private final TradingProperties props;
     private final ObjectMapper mapper;
+    private final ObjectProvider<ReconciliationService> reconciliation;
 
     public LiveCycleOrchestrator(DecisionRepository decisions, OrderRepository orders,
             OrderPlanner planner, ExecutionPort executor, AlertRecorder alerts,
-            TransactionTemplate tx, TradingProperties props, ObjectMapper strictMapper) {
+            TransactionTemplate tx, TradingProperties props, ObjectMapper strictMapper,
+            ObjectProvider<ReconciliationService> reconciliation) {
         this.decisions = decisions;
         this.orders = orders;
         this.planner = planner;
@@ -64,6 +70,7 @@ public class LiveCycleOrchestrator {
         this.tx = tx;
         this.props = props;
         this.mapper = strictMapper;
+        this.reconciliation = reconciliation;
     }
 
     public CycleOutcome executeCycle(PredictResponse response, TradeAction action,
@@ -86,9 +93,18 @@ public class LiveCycleOrchestrator {
         }
 
         try {
-            // 반환된 FillResult는 사용하지 않는다 — 실제 메모리 반영은 OrderFinalizationService가
+            // FillResult.newState는 사용하지 않는다 — 실제 메모리 반영은 OrderFinalizationService가
             // 커밋 직후 이미 수행했다(spec §2, Task 8 규칙). 여기서 중복 반영하지 않는다.
-            executor.execute(action, state, response.barClose(), barTs, ctx, decisionId);
+            // hadTimeout만은 예외 — Task 13: 이 체인이 fill-timeout(취소 경로)을 한 번이라도
+            // 거쳤다면 POST_ORDER 강제 대사를 트리거한다(lifecycle→recon 직접 의존 금지, 이
+            // orchestrator가 ChainOutcome.hadTimeout을 FillResult 경계 너머로 보고 호출한다).
+            FillResult result = executor.execute(action, state, response.barClose(), barTs, ctx, decisionId);
+            if (result.hadTimeout()) {
+                ReconciliationService recon = reconciliation.getIfAvailable();
+                if (recon != null) {
+                    recon.reconcile(Trigger.POST_ORDER);
+                }
+            }
             return CycleOutcome.EXECUTED;
         } catch (ChainIncompleteException incomplete) {
             alerts.record("CHAIN_INCOMPLETE", barTs, Map.of(

@@ -24,16 +24,20 @@ import com.rltrader.tradingcore.ledger.OrderRepository;
 import com.rltrader.tradingcore.ledger.PortfolioSnapshotRepository;
 import com.rltrader.tradingcore.portfolio.PortfolioManager;
 import com.rltrader.tradingcore.predict.ArtifactContext;
+import com.rltrader.tradingcore.reconcile.ReconciliationRepository;
 import com.rltrader.tradingcore.scheduler.DecisionScheduler;
 import java.math.BigDecimal;
 import java.time.Clock;
+import java.time.Duration;
 import java.time.Instant;
 import java.time.LocalDate;
+import java.time.ZoneId;
 import java.time.ZonedDateTime;
 import java.util.List;
 import java.util.Optional;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
 import org.junit.jupiter.api.*;
 import org.mockito.Mockito;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -51,20 +55,58 @@ import org.springframework.test.context.bean.override.mockito.MockitoBean;
 /**
  * Task 12 — live 사이클(LiveCycleOrchestrator + KisOrderExecutor) 통합 테스트.
  * predict stub은 DecisionCycleIntegrationTest와 동일한 WireMock 픽스처 형식을 재사용한다.
+ * order.recon-interval-ms를 크게 잡아 PeriodicReconciliationTrigger(Task 13, live 프로파일
+ * @Scheduled)가 실제 벽시계 기준으로 테스트 도중 끼어들지 않게 한다 — 이 클래스는 대사를 항상
+ * cycle.runCycle()이 유발하는 POST_ORDER 경로로만 검증한다(order_timeout_triggers_post_order_reconcile).
  */
 @ActiveProfiles({"test", "live"})
-@TestPropertySource(properties = "order.fill-poll-interval-ms=0")
+@TestPropertySource(properties = {"order.fill-poll-interval-ms=0", "order.recon-interval-ms=3600000"})
 @Import(LiveCycleIntegrationTest.TestClockConfig.class)
 class LiveCycleIntegrationTest extends AbstractIntegrationTest {
 
-    /** scheduler.tick()이 grid 발화로 판정할 고정 KST 평일 장중 시각 — 실제 벽시계와 무관하게 결정적. */
+    /**
+     * scheduler.tick()이 grid 발화로 판정할 고정 KST 평일 장중 시각 — 실제 벽시계와 무관하게 결정적.
+     * Task 13: order_timeout_triggers_post_order_reconcile이 fill-timeout(60s 데드라인 도달)을
+     * 시뮬레이션해야 하므로 Clock.fixed 대신 advance() 가능한 뮤터블 클록 — OrderLifecycleCancelRetryTest
+     * (execution 패키지, package-private TestMutableClock)와 동일한 패턴을 cycle 패키지에 맞게 재구현.
+     * 다른 테스트는 advance()를 호출하지 않으므로 기존 결정적 동작에 영향 없다.
+     */
     @TestConfiguration
     static class TestClockConfig {
         @Bean
         @Primary
         Clock testClock() {
-            return Clock.fixed(Instant.parse("2026-08-07T02:00:00Z"),   // 2026-08-07(금) 11:00 KST
+            return new MutableClock(Instant.parse("2026-08-07T02:00:00Z"),   // 2026-08-07(금) 11:00 KST
                     com.rltrader.tradingcore.domain.TradingGrid.KST);
+        }
+    }
+
+    static final class MutableClock extends Clock {
+        private final AtomicReference<Instant> now;
+        private final ZoneId zone;
+
+        MutableClock(Instant start, ZoneId zone) {
+            this.now = new AtomicReference<>(start);
+            this.zone = zone;
+        }
+
+        void advance(Duration d) {
+            now.updateAndGet(i -> i.plus(d));
+        }
+
+        @Override
+        public ZoneId getZone() {
+            return zone;
+        }
+
+        @Override
+        public Clock withZone(ZoneId zone) {
+            return new MutableClock(now.get(), zone);
+        }
+
+        @Override
+        public Instant instant() {
+            return now.get();
         }
     }
 
@@ -89,7 +131,13 @@ class LiveCycleIntegrationTest extends AbstractIntegrationTest {
     @Autowired AlertRepository alerts;
     @Autowired PortfolioSnapshotRepository snapshots;
     @Autowired JdbcTemplate jdbc;
+    @Autowired Clock clock;
+    @Autowired ReconciliationRepository reconciliations;
     @MockitoBean BrokerPort broker;
+
+    private MutableClock mutableClock() {
+        return (MutableClock) clock;
+    }
 
     static final ZonedDateTime BAR =
             ZonedDateTime.parse("2026-08-07T11:00:00+09:00[Asia/Seoul]");
@@ -116,9 +164,12 @@ class LiveCycleIntegrationTest extends AbstractIntegrationTest {
         decisions.deleteAll();
         alerts.deleteAll();
         snapshots.deleteAll();
+        reconciliations.deleteAll();
         portfolio.apply(PortfolioState.flat(10_000.0));
         cycle.initialize(CTX);
         Mockito.reset(broker);
+        mutableClock().advance(Duration.between(mutableClock().instant(),
+                Instant.parse("2026-08-07T02:00:00Z")));   // 매 테스트 시작 시 기준 시각으로 재정렬
     }
 
     @Test
@@ -265,5 +316,49 @@ class LiveCycleIntegrationTest extends AbstractIntegrationTest {
         wiremock.verify(0, postRequestedFor(urlEqualTo("/predict")));
         verify(broker).submitMarketOrder(eq("005930"), eq(OrderSide.SELL), eq(6L));
         assertThat(snapshots.findById("005930").orElseThrow().isLiquidationPending()).isFalse();
+    }
+
+    @Test
+    void order_timeout_triggers_post_order_reconcile() {
+        // Task 13 통합 케이스 — attempt1이 fill-timeout(60s 데드라인 도달, 부분 3주)으로 취소되고
+        // attempt2가 잔량 16주를 전량 체결해 체인이 끝난다: ChainOutcome.hadTimeout=true가
+        // LiveCycleOrchestrator를 거쳐 reconcile(POST_ORDER) 1회 호출로 이어져야 한다
+        // (OrderLifecycleCancelRetryTest.timeout_cancels_then_retries_once_in_same_finalization_tx와
+        // 동일 타임아웃 시뮬레이션 패턴 — MutableClock.advance()로 실시간 대기 없이 데드라인 도달).
+        wiremock.stubFor(post("/predict").willReturn(okJson(
+                okBody(1, "add_unit", "2026-08-07T11:00:00+09:00"))));   // qty=floor(1990/100)=19
+
+        when(broker.submitMarketOrder(eq("005930"), eq(OrderSide.BUY), eq(19L)))
+                .thenReturn(new KisOrderAck("T001"));
+        when(broker.submitMarketOrder(eq("005930"), eq(OrderSide.BUY), eq(16L)))
+                .thenReturn(new KisOrderAck("T002"));
+        // attempt1: 폴링 1회차 부분(3주) → clock 61s 전진 → 데드라인 도달 → 취소 흐름
+        when(broker.orderSnapshot(eq("T001"), any(LocalDate.class)))
+                .thenAnswer(inv -> {
+                    mutableClock().advance(Duration.ofSeconds(61));
+                    return Optional.of(new KisOrderSnapshot(
+                            "T001", 19, 3, new BigDecimal("100.0"), false, false));
+                })
+                .thenReturn(Optional.of(new KisOrderSnapshot(
+                        "T001", 19, 3, new BigDecimal("100.0"), true, true)));   // 취소 확정
+        // attempt2: 잔량 16주 전량 체결
+        when(broker.orderSnapshot(eq("T002"), any(LocalDate.class)))
+                .thenReturn(Optional.of(new KisOrderSnapshot(
+                        "T002", 16, 16, new BigDecimal("100.0"), true, false)));
+        // POST_ORDER 대사가 체인 완료 직후 이어서 부르는 order-level 스캔: 두 attempt 모두 이미
+        // 종결 상태이므로 non-terminal 스캔은 빈 목록, CANCELLED(attempt1) 재조회는
+        // accounted(3)==canonical(3)이라 adjustment 없음 — 세 번째 balance() 호출은
+        // reconcile(POST_ORDER)의 balance-level 몫이다.
+        when(broker.balance())
+                .thenReturn(new KisBalance(3, new BigDecimal("9700.00")))    // attempt1 finalization
+                .thenReturn(new KisBalance(19, new BigDecimal("8100.00")))   // attempt2 finalization
+                .thenReturn(new KisBalance(19, new BigDecimal("8100.00")));  // reconcile(POST_ORDER)
+
+        CycleOutcome outcome = cycle.runCycle(BAR, null);
+
+        assertThat(outcome).isEqualTo(CycleOutcome.EXECUTED);
+        assertThat(orders.findAll()).anySatisfy(o ->
+                assertThat(o.getStatus()).isEqualTo(OrderStatus.FILLED));
+        assertThat(reconciliations.findAll()).anyMatch(r -> r.getTriggerSource().equals("POST_ORDER"));
     }
 }
