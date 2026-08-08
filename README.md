@@ -134,17 +134,16 @@ SPRING_PROFILES_ACTIVE=smoke ./gradlew bootRun
 기동 후 다음 로그를 순서대로 확인합니다 (약 1-3분 소요):
 
 ```
-[BootSequence] HALT: Ready gate — polling /ready...
-[HandshakeValidator] Handshake validation passed
-[PortfolioManager] Portfolio snapshot restored | Portfolio created (initial)
-[DecisionCycleService] Cycle initialized
-[DecisionScheduler] Scheduler enabled — 5-min grid active
+handshake ok (live): artifact=<artifact_id> fs=<feature_schema_version>
+artifact mismatch (...) but KIS holding is 0 — resetting to flat
+(또는: handshake ok: artifact=... fs=... // dry-run 경로)
 ```
 
-**이상 로그 예시** (이 경우 중단하고 원인 확인):
-- `HALT: Handshake validation failed` — artifact_id, feature_schema_version, unit_fraction 등 불일치
-- `HALT: Restore failed` — DB 손상 또는 schema migration 실패
-- `Predict server not ready` — `/ready`가 200을 반환하지 않음
+**기동 중단되는 경우** (이 경우 원인 확인 필수):
+- `IllegalStateException: predict server not ready within <N>s` — predict 서버 `/ready`가 응답하지 않음
+- `assertNoActiveHalt()` 예외 메시지 + 코드 — DB에 active HALT가 있음 (수동으로 `halts.cleared_at` 입력 후 재기동)
+- `IllegalStateException: boot chain invariant violated for decision <id>` — IN_PROGRESS 결정에 실행 주체 없음 (복구 실패)
+- `IllegalStateException: artifact mismatch with real holdings (<N>) — boot halted` — 아티팩트 불일치 + 실보유 있음 (spec §7 ⑦)
 
 ### 실거래 체결 검증 (장중 10:05 이후 권장)
 
@@ -154,7 +153,7 @@ SPRING_PROFILES_ACTIVE=smoke ./gradlew bootRun
 
 2. **주문 제출 확인** (logs or DB)
    ```sql
-   SELECT id, order_id, side, qty, price, state, submitted_at 
+   SELECT id, side, qty, order_type, status, avg_fill_price, submitted_at 
    FROM orders 
    WHERE created_at > now() - interval '5 minutes'
    ORDER BY created_at DESC;
@@ -163,33 +162,36 @@ SPRING_PROFILES_ACTIVE=smoke ./gradlew bootRun
 3. **Add 주문 체결 확인** (1회 이상)
    ```sql
    -- 주문 상태
-   SELECT id, order_id, side, qty, price, state 
-   FROM orders WHERE side = 'BUY' LIMIT 1;
+   SELECT id, side, qty, order_type, status, avg_fill_price, submitted_at 
+   FROM orders WHERE side = 'BUY' AND created_at > now() - interval '1 hour'
+   LIMIT 1;
    
    -- 체결 이벤트
-   SELECT id, order_id, event_type, qty, filled_qty, submitted_at 
-   FROM order_events WHERE order_id = <order_id>;
+   SELECT id, order_id, from_status, to_status, created_at 
+   FROM order_events WHERE order_id = <order_id>
+   ORDER BY created_at;
    
    -- 실제 체결
-   SELECT id, order_id, filled_qty, fill_price, exec_datetime 
+   SELECT id, order_id, fill_price, shares_delta, created_at 
    FROM executions WHERE order_id = <order_id>;
    
    -- 포트폴리오 스냅샷
-   SELECT timestamp, units, avg_cost, market_value, cash 
+   SELECT symbol, units, shares, cash, entry_bar_ts, updated_at 
    FROM portfolio_snapshots 
-   ORDER BY timestamp DESC LIMIT 1;
+   WHERE symbol = '005930';
    ```
 
 4. **Clear 주문 체결 확인** (1회 이상)
    ```sql
    -- Clear 주문 (SELL)
-   SELECT id, order_id, side, qty, price, state 
-   FROM orders WHERE side = 'SELL' LIMIT 1;
+   SELECT id, side, qty, order_type, status, avg_fill_price, submitted_at 
+   FROM orders WHERE side = 'SELL' AND created_at > now() - interval '1 hour'
+   LIMIT 1;
    
    -- 대사 레코드
-   SELECT id, bar_ts, recon_type, units_before, units_after, status 
+   SELECT id, trigger_source, level, result, created_at 
    FROM reconciliations 
-   ORDER BY bar_ts DESC LIMIT 1;
+   ORDER BY created_at DESC LIMIT 5;
    ```
 
 ### 주문 지연 분석 (실측 기록)
@@ -197,16 +199,17 @@ SPRING_PROFILES_ACTIVE=smoke ./gradlew bootRun
 다음 SQL을 실행하여 시스템과 KIS 간의 지연을 측정합니다:
 
 ```sql
--- ack 타임아웃 확인 (orders.submitted_at ↔ order_events 첫 ACK)
+-- ack 타임아웃 확인 (orders.submitted_at ↔ order_events ACKED 상태 전이)
 SELECT 
   o.id,
-  o.order_id,
+  o.side,
+  o.qty,
   o.submitted_at,
-  oe.submitted_at as oe_ack_at,
-  EXTRACT(EPOCH FROM (oe.submitted_at - o.submitted_at)) as ack_delay_sec
+  oe_ack.created_at as oe_acked_at,
+  EXTRACT(EPOCH FROM (oe_ack.created_at - o.submitted_at)) * 1000 as ack_delay_ms
 FROM orders o
-LEFT JOIN order_events oe ON oe.order_id = o.order_id 
-  AND oe.event_type = 'ACK'
+LEFT JOIN order_events oe_ack ON oe_ack.order_id = o.id 
+  AND oe_ack.to_status = 'ACKED'
 WHERE o.submitted_at > now() - interval '1 hour'
 ORDER BY o.submitted_at DESC;
 
@@ -216,11 +219,11 @@ SELECT
   o.side,
   o.qty,
   o.submitted_at,
-  oe_fill.submitted_at as filled_at,
-  EXTRACT(EPOCH FROM (oe_fill.submitted_at - o.submitted_at)) as fill_delay_sec
+  oe_fill.created_at as filled_at,
+  EXTRACT(EPOCH FROM (oe_fill.created_at - o.submitted_at)) * 1000 as fill_delay_ms
 FROM orders o
-LEFT JOIN order_events oe_fill ON oe_fill.order_id = o.order_id
-  AND oe_fill.event_type = 'FILL'
+LEFT JOIN order_events oe_fill ON oe_fill.order_id = o.id
+  AND oe_fill.to_status = 'FILLED'
 WHERE o.submitted_at > now() - interval '1 hour'
 ORDER BY o.submitted_at DESC;
 ```
@@ -246,12 +249,14 @@ ORDER BY o.submitted_at DESC;
    ./gradlew bootRun --args="--spring.profiles.active=live"
    ```
 
-3. **복원 & 대사 검증** (로그 확인)
-   ```
-   [BootSequence] HALT: Ready gate — polling /ready...
-   [PortfolioManager] Portfolio snapshot restored (prior state recovered)
-   [ReconciliationService] STARTUP reconciliation: status=CLEAN (no discrepancy)
-   [DecisionScheduler] Scheduler enabled
+3. **복원 & 대사 검증** (로그 + DB 확인)
+   - 로그: `handshake ok (live): artifact=... fs=...` 메시지 확인
+   - DB: reconciliations 테이블에서 최신 행의 `trigger_source = 'STARTUP'`, `result = 'CLEAN'` 확인
+   ```sql
+   SELECT id, trigger_source, level, result, created_at 
+   FROM reconciliations 
+   WHERE trigger_source = 'STARTUP'
+   ORDER BY created_at DESC LIMIT 1;
    ```
 
 ### 완료 기준
