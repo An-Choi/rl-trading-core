@@ -9,6 +9,7 @@ import com.rltrader.tradingcore.domain.PortfolioState;
 import com.rltrader.tradingcore.kis.BrokerPort;
 import com.rltrader.tradingcore.kis.KisBalance;
 import com.rltrader.tradingcore.kis.KisOrderSnapshot;
+import com.rltrader.tradingcore.ledger.AlertRepository;
 import com.rltrader.tradingcore.ledger.ExecutionAdjustmentRepository;
 import com.rltrader.tradingcore.ledger.HaltRepository;
 import com.rltrader.tradingcore.ledger.OrderEventRepository;
@@ -50,6 +51,7 @@ class ReconciliationServiceTest extends AbstractIntegrationTest {
     @Autowired ExecutionAdjustmentRepository adjustments;
     @Autowired OrderEventRepository orderEvents;
     @Autowired HaltRepository halts;
+    @Autowired AlertRepository alertRepo;
     @Autowired CycleAdmissionGate gate;
     @MockitoBean BrokerPort broker;
 
@@ -62,6 +64,7 @@ class ReconciliationServiceTest extends AbstractIntegrationTest {
         jdbc.update("DELETE FROM orders");
         jdbc.update("DELETE FROM decisions");
         jdbc.update("DELETE FROM halts");
+        jdbc.update("DELETE FROM alerts");
         snapshots.deleteAll();
         reset(broker);
         // 잠긴 채로 남는 테스트가 없어야 하지만 방어적으로 항상 release 가능한 상태로 시작
@@ -171,7 +174,7 @@ class ReconciliationServiceTest extends AbstractIntegrationTest {
     /**
      * 리뷰 수정 케이스 — 브리프 8개 시나리오는 아니지만 코드 리뷰에서 발견된 회귀 방어: SELL
      * 주문이 브로커 관점에서 취소 확정됐는데 잔량이 남아있으면(부분 체결) 정상 취소 경로
-     * (OrderLifecycleService)와 동일하게 이월(liquidation)로 커밋해야 한다. finalizeObservedCancel이
+     * (OrderLifecycleService)와 동일하게 이월(liquidation)로 커밋해야 한다. finalizeObservedTerminalRemainder가
      * 무조건 ChainNext.markCompleted()로 확정하면 decisions.execution_status가 COMPLETED로
      * 굳어지고 liquidation_pending도 false로 남아 LiquidationService.resume()의 유일한 스캐너가
      * 이 잔량을 영구히 찾지 못한다.
@@ -202,6 +205,100 @@ class ReconciliationServiceTest extends AbstractIntegrationTest {
         Map<String, Object> decision = jdbc.queryForMap(
                 "SELECT execution_status FROM decisions WHERE id = ?", d);
         assertThat(decision.get("execution_status")).isEqualTo("IN_PROGRESS");
+    }
+
+    /**
+     * Critical 리뷰 수정 — BUY + 잔량 있음: 정상 경로(OrderLifecycleService)는 재시도 상한 도달 시
+     * add를 포기하고 체인을 완료(markCompleted) + decisionTotalQty 기준 PARTIAL_UNIT/EXECUTION_FAILED
+     * 알림을 남긴다. 대사가 이를 관찰해도 같은 시맨틱을 재현해야 한다 — decisionTotalQty는
+     * OrderRepository.sumAccountedFilledQtyByDecisionId 재사용(브리프 지시), 여기서는 이 order가
+     * 이 decision의 유일한 attempt이므로 canonical filled(7)가 곧 decisionTotalQty.
+     */
+    @Test
+    void observed_cancel_with_buy_remainder_completes_decision_with_partial_unit_alert() {
+        long d = insertDecision();
+        jdbc.update("UPDATE decisions SET execution_status = 'IN_PROGRESS' WHERE id = ?", d);
+        long orderId = insertOpenOrder(d, "K001B", 10);
+        seedSnapshot(0, 0.0, 10_000.0);
+
+        // 브로커가 7주만 체결하고 잔량 3주를 남긴 채 취소 확정 — BUY 부분 체결(재시도 상한 도달 관찰).
+        when(broker.orderSnapshot(eq("K001B"), any(LocalDate.class)))
+                .thenReturn(Optional.of(new KisOrderSnapshot("K001B", 10, 7, new BigDecimal("100.0"), true, true)));
+        when(broker.balance()).thenReturn(new KisBalance(7, new BigDecimal("9300.00")));
+
+        recon.reconcile(Trigger.PERIODIC);
+
+        Map<String, Object> order = jdbc.queryForMap("SELECT * FROM orders WHERE id = ?", orderId);
+        assertThat(order.get("status")).isEqualTo("CANCELLED");
+        assertThat(((Number) order.get("accounted_filled_qty")).longValue()).isEqualTo(7L);
+
+        // BUY 체인 종료 — 이월이 아니라 완료. execution_status가 COMPLETED로 확정.
+        Map<String, Object> decision = jdbc.queryForMap(
+                "SELECT execution_status FROM decisions WHERE id = ?", d);
+        assertThat(decision.get("execution_status")).isEqualTo("COMPLETED");
+        assertThat(snapshots.findById(SYMBOL).orElseThrow().isLiquidationPending()).isFalse();
+
+        // decisionTotalQty(7) > 0 → PARTIAL_UNIT, units +1(첫 진입).
+        assertThat(portfolio.current().units()).isEqualTo(1);
+        assertThat(alertRepo.findAll()).anySatisfy(a -> assertThat(a.getCode()).isEqualTo("PARTIAL_UNIT"));
+        assertThat(alertRepo.findAll()).noneSatisfy(a -> assertThat(a.getCode()).isEqualTo("EXECUTION_FAILED"));
+    }
+
+    /**
+     * Critical 리뷰 수정 — BUY 전량 미체결(decisionTotalQty == 0)로 관찰 종결되면 EXECUTION_FAILED
+     * 알림, units는 증가하지 않는다(체결이 전혀 없었으므로 진입 판정 자체가 성립하지 않음).
+     */
+    @Test
+    void observed_cancel_with_zero_fill_buy_records_execution_failed_alert() {
+        long d = insertDecision();
+        jdbc.update("UPDATE decisions SET execution_status = 'IN_PROGRESS' WHERE id = ?", d);
+        long orderId = insertOpenOrder(d, "K001Z", 10);
+        seedSnapshot(0, 0.0, 10_000.0);
+
+        when(broker.orderSnapshot(eq("K001Z"), any(LocalDate.class)))
+                .thenReturn(Optional.of(new KisOrderSnapshot("K001Z", 10, 0, null, true, true)));
+        when(broker.balance()).thenReturn(new KisBalance(0, new BigDecimal("10000.00")));
+
+        recon.reconcile(Trigger.PERIODIC);
+
+        Map<String, Object> order = jdbc.queryForMap("SELECT * FROM orders WHERE id = ?", orderId);
+        assertThat(order.get("status")).isEqualTo("CANCELLED");
+        assertThat(((Number) order.get("accounted_filled_qty")).longValue()).isEqualTo(0L);
+
+        assertThat(portfolio.current().units()).isEqualTo(0);
+        assertThat(alertRepo.findAll()).anySatisfy(a -> assertThat(a.getCode()).isEqualTo("EXECUTION_FAILED"));
+        assertThat(alertRepo.findAll()).noneSatisfy(a -> assertThat(a.getCode()).isEqualTo("PARTIAL_UNIT"));
+    }
+
+    /**
+     * Important 리뷰 수정 — brokerTerminal && !cancelled인데 filled_qty < qty(예: IOC/FOK가 잔량을
+     * 미체결로 종결)면 FILLED로 오판하면 안 된다. FILLED는 ck_orders_filled_terminal CHECK로
+     * filled_qty == qty를 강제하므로, 이전 코드(brokerTerminal && !cancelled만으로 FILLED 판정)는
+     * 이 케이스에서 finalizeChain의 tx가 CHECK violation으로 롤백됐다. 이제는 종결·잔량-있음
+     * 경로(취소와 동일 시맨틱)로 처리해야 한다.
+     */
+    @Test
+    void observed_terminal_not_cancelled_with_partial_fill_is_treated_as_cancelled_remainder() {
+        long d = insertDecision();
+        jdbc.update("UPDATE decisions SET execution_status = 'IN_PROGRESS' WHERE id = ?", d);
+        long orderId = insertOpenOrder(d, "K001T", 10);
+        seedSnapshot(0, 0.0, 10_000.0);
+
+        // brokerTerminal=true, cancelled=false, filled=3/10 — IOC/FOK류 잔량 미체결 종결.
+        when(broker.orderSnapshot(eq("K001T"), any(LocalDate.class)))
+                .thenReturn(Optional.of(new KisOrderSnapshot("K001T", 10, 3, new BigDecimal("100.0"), true, false)));
+        when(broker.balance()).thenReturn(new KisBalance(3, new BigDecimal("9700.00")));
+
+        recon.reconcile(Trigger.PERIODIC);
+
+        // ck_orders_filled_terminal CHECK(status<>'FILLED' OR filled_qty=qty)를 위반하지 않고
+        // CANCELLED로 정상 커밋됐어야 한다 — 위반 시 이 쿼리 자체가 rollback된 tx 때문에 실패한다.
+        Map<String, Object> order = jdbc.queryForMap("SELECT * FROM orders WHERE id = ?", orderId);
+        assertThat(order.get("status")).isEqualTo("CANCELLED");
+        assertThat(((Number) order.get("filled_qty")).longValue()).isEqualTo(3L);
+        assertThat(((Number) order.get("accounted_filled_qty")).longValue()).isEqualTo(3L);
+
+        assertThat(alertRepo.findAll()).anySatisfy(a -> assertThat(a.getCode()).isEqualTo("PARTIAL_UNIT"));
     }
 
     // ---------------------------------------------------------------- 시나리오 2

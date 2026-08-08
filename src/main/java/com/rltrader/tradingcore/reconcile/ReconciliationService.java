@@ -12,6 +12,9 @@ import com.rltrader.tradingcore.kis.BrokerPort;
 import com.rltrader.tradingcore.kis.KisBalance;
 import com.rltrader.tradingcore.kis.KisOrderSnapshot;
 import com.rltrader.tradingcore.kis.KisTransportException;
+import com.rltrader.tradingcore.ledger.AlertRecorder;
+import com.rltrader.tradingcore.ledger.DecisionEntity;
+import com.rltrader.tradingcore.ledger.DecisionRepository;
 import com.rltrader.tradingcore.ledger.ExecutionAdjustmentEntity;
 import com.rltrader.tradingcore.ledger.ExecutionAdjustmentRepository;
 import com.rltrader.tradingcore.ledger.OrderEntity;
@@ -26,6 +29,7 @@ import java.math.BigDecimal;
 import java.math.RoundingMode;
 import java.time.Clock;
 import java.time.OffsetDateTime;
+import java.time.ZonedDateTime;
 import java.util.ArrayList;
 import java.util.EnumSet;
 import java.util.List;
@@ -55,12 +59,14 @@ public class ReconciliationService {
 
     private final BrokerPort broker;
     private final OrderRepository orders;
+    private final DecisionRepository decisions;
     private final OrderFinalizationService finalization;
     private final OrderEventRepository events;
     private final ExecutionAdjustmentRepository adjustments;
     private final PortfolioSnapshotRepository snapshots;
     private final PortfolioManager portfolio;
     private final HaltService halts;
+    private final AlertRecorder alerts;
     private final CycleAdmissionGate gate;
     private final ReconciliationRepository reconciliations;
     private final TradingProperties tradingProps;
@@ -70,20 +76,22 @@ public class ReconciliationService {
     private final org.springframework.jdbc.core.JdbcTemplate jdbc;
 
     public ReconciliationService(BrokerPort broker, OrderRepository orders,
-            OrderFinalizationService finalization, OrderEventRepository events,
-            ExecutionAdjustmentRepository adjustments, PortfolioSnapshotRepository snapshots,
-            PortfolioManager portfolio, HaltService halts, CycleAdmissionGate gate,
-            ReconciliationRepository reconciliations, TradingProperties tradingProps,
-            TransactionTemplate tx, Clock clock, ObjectMapper strictMapper,
-            org.springframework.jdbc.core.JdbcTemplate jdbc) {
+            DecisionRepository decisions, OrderFinalizationService finalization,
+            OrderEventRepository events, ExecutionAdjustmentRepository adjustments,
+            PortfolioSnapshotRepository snapshots, PortfolioManager portfolio, HaltService halts,
+            AlertRecorder alerts, CycleAdmissionGate gate, ReconciliationRepository reconciliations,
+            TradingProperties tradingProps, TransactionTemplate tx, Clock clock,
+            ObjectMapper strictMapper, org.springframework.jdbc.core.JdbcTemplate jdbc) {
         this.broker = broker;
         this.orders = orders;
+        this.decisions = decisions;
         this.finalization = finalization;
         this.events = events;
         this.adjustments = adjustments;
         this.snapshots = snapshots;
         this.portfolio = portfolio;
         this.halts = halts;
+        this.alerts = alerts;
         this.gate = gate;
         this.reconciliations = reconciliations;
         this.tradingProps = tradingProps;
@@ -136,14 +144,17 @@ public class ReconciliationService {
             if (snap == null) {
                 continue;
             }
-            boolean filled = snap.cumulativeFilledQty() >= order.getQty()
-                    || (snap.brokerTerminal() && !snap.cancelled());
-            if (filled) {
+            // 리뷰 수정(Important) — FILLED는 filled_qty == qty일 때만이다(ck_orders_filled_terminal
+            // CHECK가 이를 강제). 이전엔 brokerTerminal && !cancelled만으로 FILLED 판정해, IOC/FOK 등
+            // 브로커가 "더 이상 진행 안 함"을 잔량 미체결인 채 종결로 보고하는 경우 DB CHECK 위반으로
+            // tx가 그대로 롤백됐다 — 전량 체결이 아니면 항상 아래 "종결·잔량 있음" 경로로 보낸다.
+            boolean fullyFilled = snap.cumulativeFilledQty() == order.getQty();
+            if (fullyFilled) {
                 finalizeObservedFill(order, snap);
                 detail.add(Map.of("orderId", order.getId(), "action", "FINALIZED_FILLED"));
                 anySync = true;
-            } else if (snap.brokerTerminal() && snap.cancelled()) {
-                finalizeObservedCancel(order, snap);
+            } else if (snap.brokerTerminal()) {
+                finalizeObservedTerminalRemainder(order, snap);
                 detail.add(Map.of("orderId", order.getId(), "action", "FINALIZED_CANCELLED"));
                 anySync = true;
             } else {
@@ -179,14 +190,20 @@ public class ReconciliationService {
         }
     }
 
-    /** 관찰 점프(FILLED) — 공유 finalization 경로, RECOVERY 모드(spec §6 Interfaces 블록). */
+    /**
+     * 관찰 점프(FILLED, filled_qty == qty) — 공유 finalization 경로, RECOVERY 모드(spec §6
+     * Interfaces 블록). FILLED는 체인이 항상 끝나는 경우이므로 OrderLifecycleService.finalizeFilled와
+     * 동일하게 BUY는 units +1(첫 진입 시 entryBarTs는 decision의 원 bar_ts) — 리뷰 수정: 이전엔
+     * units를 전혀 건드리지 않아, 대사가 관찰한 ghost fill이 정상 체결 경로와 다른 포트폴리오
+     * 상태로 이어지는 회귀가 있었다.
+     */
     private void finalizeObservedFill(OrderEntity order, KisOrderSnapshot snap) {
         KisBalance balance = balanceOrNull();
         if (balance == null) {
             return;   // 잔고 확정 실패 — 이번 회차는 건너뛰고 비종결 유지 (다음 대사가 재시도)
         }
         long delta = snap.cumulativeFilledQty() - order.getAccountedFilledQty();
-        PortfolioState after = applyObservedFill(order, delta, balance);
+        PortfolioState after = applyObservedFill(order, delta, balance, order.getSide() == OrderSide.BUY);
         // RECOVERY 모드에서 ctx는 finalizeChain 내부에서 절대 역참조되지 않는다
         // (OrderFinalizationService.saveSnapshot의 RECOVERY 분기는 기존 snapshot의 artifact_id를
         // 보존하거나 decision의 artifact_id로 대체한다 — ctx.artifactId() 호출 경로는 NORMAL 전용).
@@ -195,38 +212,84 @@ public class ReconciliationService {
     }
 
     /**
-     * 관찰 점프(CANCELLED, 잔량 있음) — brokerTerminal && cancelled.
-     * 리뷰 수정 — SELL이고 잔량(qty − canonical filled)이 남아있으면 OrderLifecycleService의
-     * 정상 취소 경로와 동일하게 ChainNext.liquidation()으로 이월해야 한다(spec §10 이월 규칙).
-     * 무조건 markCompleted()로 커밋하면 decisions.execution_status가 COMPLETED로 확정되고
-     * liquidationPending도 false로 남아, LiquidationService.resume()의 유일한 스캐너가 이 잔량을
-     * 영구히 찾지 못한다 — "정상 경로와 동일 취급"이 대사 경로에서도 지켜져야 한다(spec §6).
-     * BUY 잔량은 정상 경로도 재시도 상한 도달 시 add를 포기하고 completed로 끝내므로(관찰 시점에는
-     * 재시도 여부를 판단할 attempt 컨텍스트가 없다) 대사는 안전하게 completed로 확정한다.
+     * 관찰 점프(종결·잔량 있음) — brokerTerminal이지만 filled_qty == qty가 아닌 모든 경우
+     * (명시적 취소 확정뿐 아니라 IOC/FOK 등 브로커가 잔량을 남긴 채 더 이상 진행하지 않는 경우도
+     * 포함, Important 리뷰 수정). OrderLifecycleService의 체인 종료 분기(§9~10)와 동일한 side별
+     * give-up 시맨틱을 대사 경로에서도 재현한다(Critical 리뷰 수정):
+     *
+     * <ul>
+     *   <li>SELL + 잔량 > 0: 이월(liquidation) — ChainNext.liquidation()으로 liquidationPending=true,
+     *       execution_status는 IN_PROGRESS 유지. LiquidationService.resume()이 다음 세션에 재개.</li>
+     *   <li>BUY + 잔량(무관, 항상) 또는 SELL 전량 소진: 체인 종료(add 포기/clear 완료) —
+     *       ChainNext.markCompleted() + decisionTotalQty 기준 PARTIAL_UNIT/EXECUTION_FAILED 알림,
+     *       decisionTotalQty > 0이면 units +1(첫 진입 시 entryBarTs를 decision의 원 bar_ts로 세팅 —
+     *       OrderLifecycleService.applyFill과 동일 규칙, 과거 bar로 재진입 판정하지 않는다).</li>
+     * </ul>
+     *
+     * decisionTotalQty는 OrderLifecycleService와 동일하게 OrderRepository.sumAccountedFilledQtyByDecisionId
+     * 를 재사용한다(재도출 금지, 브리프 지시) — 단, 이 order 자신의 accounted는 아직 canonical로
+     * 갱신되기 전(finalizeChain 내부에서 갱신됨)이므로 합계에서 자신의 stale 값을 빼고 canonical로
+     * 대체해야 한다.
      */
-    private void finalizeObservedCancel(OrderEntity order, KisOrderSnapshot snap) {
+    private void finalizeObservedTerminalRemainder(OrderEntity order, KisOrderSnapshot snap) {
         KisBalance balance = balanceOrNull();
         if (balance == null) {
             return;
         }
         long delta = snap.cumulativeFilledQty() - order.getAccountedFilledQty();
-        PortfolioState after = applyObservedFill(order, delta, balance);
         long remaining = order.getQty() - snap.cumulativeFilledQty();
-        ChainNext next = order.getSide() == OrderSide.SELL && remaining > 0
-                ? ChainNext.liquidation() : ChainNext.markCompleted();
+        long decisionTotalQty = orders.sumAccountedFilledQtyByDecisionId(order.getDecisionId())
+                - order.getAccountedFilledQty() + snap.cumulativeFilledQty();
+
+        if (order.getSide() == OrderSide.SELL && remaining > 0) {
+            PortfolioState after = applyObservedFill(order, delta, balance, false);
+            finalization.finalizeChain(order, OrderStatus.CANCELLED, snap, after,
+                    ChainNext.liquidation(), null, TransitionMode.RECOVERY);
+            return;
+        }
+
+        // 이 지점 도달 = 체인 종료(BUY는 항상, SELL은 remaining<=0로 전량 소진). units +1은
+        // BUY이고 decisionTotalQty > 0(체인 전체에 걸쳐 조금이라도 체결이 있었음)일 때만.
+        boolean bumpUnit = order.getSide() == OrderSide.BUY && decisionTotalQty > 0;
+        PortfolioState after = applyObservedFill(order, delta, balance, bumpUnit);
         finalization.finalizeChain(order, OrderStatus.CANCELLED, snap, after,
-                next, null, TransitionMode.RECOVERY);
+                ChainNext.markCompleted(), null, TransitionMode.RECOVERY);
+
+        ZonedDateTime barTs = decisionBarTs(order.getDecisionId());
+        if (decisionTotalQty > 0) {
+            alerts.record("PARTIAL_UNIT", barTs, Map.of(
+                    "decisionId", order.getDecisionId(), "filledQty", decisionTotalQty,
+                    "orderedQty", order.getQty(), "source", "RECONCILE"));
+        } else {
+            alerts.record("EXECUTION_FAILED", barTs, Map.of(
+                    "decisionId", order.getDecisionId(), "orderedQty", order.getQty(),
+                    "source", "RECONCILE"));
+        }
     }
 
-    private PortfolioState applyObservedFill(OrderEntity order, long deltaQty, KisBalance balance) {
+    /** decision의 원 bar_ts(첫 unit 진입 시각 세팅용, alert 채널용) — OffsetDateTime → ZonedDateTime(KST). */
+    private ZonedDateTime decisionBarTs(long decisionId) {
+        DecisionEntity d = decisions.findById(decisionId).orElseThrow();
+        return d.getBarTs().atZoneSameInstant(com.rltrader.tradingcore.domain.TradingGrid.KST);
+    }
+
+    /**
+     * bumpUnitOnBuyChainEnd: BUY 체인이 이번 호출로 끝나고(decisionTotalQty > 0) units를 +1 해야
+     * 하는 경우에만 true — OrderLifecycleService.applyFill의 chainEnding && !isSell 분기와 동일
+     * 규칙(첫 진입이면 entryBarTs를 decision의 원 bar_ts로 세팅, 아니면 기존 유지).
+     */
+    private PortfolioState applyObservedFill(OrderEntity order, long deltaQty, KisBalance balance,
+            boolean bumpUnitOnBuyChainEnd) {
         PortfolioState before = portfolio.current();
-        if (deltaQty <= 0) {
-            return new PortfolioState(before.units(), before.shares(),
-                    balance.cashBalance().doubleValue(), before.entryBarTs());
+        double signedDelta = deltaQty <= 0 ? 0
+                : (order.getSide() == OrderSide.SELL ? -deltaQty : deltaQty);
+        double newShares = before.shares() + signedDelta;
+        double cash = balance.cashBalance().doubleValue();
+        if (!bumpUnitOnBuyChainEnd) {
+            return new PortfolioState(before.units(), newShares, cash, before.entryBarTs());
         }
-        double signedDelta = order.getSide() == OrderSide.SELL ? -deltaQty : deltaQty;
-        return new PortfolioState(before.units(), before.shares() + signedDelta,
-                balance.cashBalance().doubleValue(), before.entryBarTs());
+        ZonedDateTime entry = before.units() == 0 ? decisionBarTs(order.getDecisionId()) : before.entryBarTs();
+        return new PortfolioState(before.units() + 1, newShares, cash, entry);
     }
 
     private KisBalance balanceOrNull() {
