@@ -94,6 +94,15 @@ class ReconciliationServiceTest extends AbstractIntegrationTest {
             RETURNING id""", Long.class, decisionId, SYMBOL, qty, kisOrderNo);
     }
 
+    /** 비종결(ACKED) SELL 주문 — 이월(liquidation) 시나리오용, filled 0. */
+    private long insertOpenSellOrder(long decisionId, String kisOrderNo, long qty) {
+        return jdbc.queryForObject("""
+            INSERT INTO orders (decision_id, attempt, trading_date, symbol, side, qty, order_type,
+                status, kis_order_no, filled_qty, accounted_filled_qty, accounted_fill_notional)
+            VALUES (?, 1, CURRENT_DATE, ?, 'SELL', ?, 'MARKET', 'ACKED', ?, 0, 0, 0)
+            RETURNING id""", Long.class, decisionId, SYMBOL, qty, kisOrderNo);
+    }
+
     /** CANCELLED 주문 — accounted qty/notional 지정, filled_qty=accounted(부분 체결로 종결). */
     private long insertCancelledOrder(long decisionId, String kisOrderNo, long qty,
             long accountedQty, BigDecimal accountedNotional) {
@@ -157,6 +166,42 @@ class ReconciliationServiceTest extends AbstractIntegrationTest {
 
         assertThat(reconRows("ORDER")).hasSize(1);
         assertThat(reconRows("ORDER").get(0).get("result")).isEqualTo("SYNCED");
+    }
+
+    /**
+     * 리뷰 수정 케이스 — 브리프 8개 시나리오는 아니지만 코드 리뷰에서 발견된 회귀 방어: SELL
+     * 주문이 브로커 관점에서 취소 확정됐는데 잔량이 남아있으면(부분 체결) 정상 취소 경로
+     * (OrderLifecycleService)와 동일하게 이월(liquidation)로 커밋해야 한다. finalizeObservedCancel이
+     * 무조건 ChainNext.markCompleted()로 확정하면 decisions.execution_status가 COMPLETED로
+     * 굳어지고 liquidation_pending도 false로 남아 LiquidationService.resume()의 유일한 스캐너가
+     * 이 잔량을 영구히 찾지 못한다.
+     */
+    @Test
+    void observed_cancel_with_sell_remainder_carries_over_as_liquidation() {
+        long d = insertDecision();
+        // 이 시나리오의 decision은 아직 진행 중인 SELL 체인이다(insertDecision()의 COMPLETED
+        // 기본값은 이미 종결된 다른 시나리오용) — finalizeChain은 next.completed()==false일 때
+        // execution_status를 건드리지 않으므로, 대사 전 상태를 실제 미완료 체인과 맞춰야 한다.
+        jdbc.update("UPDATE decisions SET execution_status = 'IN_PROGRESS' WHERE id = ?", d);
+        long orderId = insertOpenSellOrder(d, "K001S", 10);
+        seedSnapshot(0, 10.0, 9_000.0);
+
+        // 브로커가 6주만 체결하고 잔량 4주를 남긴 채 취소 확정을 보고 — SELL 부분 체결.
+        when(broker.orderSnapshot(eq("K001S"), any(LocalDate.class)))
+                .thenReturn(Optional.of(new KisOrderSnapshot("K001S", 10, 6, new BigDecimal("100.0"), true, true)));
+        when(broker.balance()).thenReturn(new KisBalance(4, new BigDecimal("9600.00")));
+
+        recon.reconcile(Trigger.PERIODIC);
+
+        Map<String, Object> order = jdbc.queryForMap("SELECT * FROM orders WHERE id = ?", orderId);
+        assertThat(order.get("status")).isEqualTo("CANCELLED");
+        assertThat(((Number) order.get("accounted_filled_qty")).longValue()).isEqualTo(6L);
+
+        assertThat(snapshots.findById(SYMBOL).orElseThrow().isLiquidationPending()).isTrue();
+
+        Map<String, Object> decision = jdbc.queryForMap(
+                "SELECT execution_status FROM decisions WHERE id = ?", d);
+        assertThat(decision.get("execution_status")).isEqualTo("IN_PROGRESS");
     }
 
     // ---------------------------------------------------------------- 시나리오 2

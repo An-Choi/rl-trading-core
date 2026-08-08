@@ -100,16 +100,33 @@ public class LiveCycleOrchestrator {
             // orchestrator가 ChainOutcome.hadTimeout을 FillResult 경계 너머로 보고 호출한다).
             FillResult result = executor.execute(action, state, response.barClose(), barTs, ctx, decisionId);
             if (result.hadTimeout()) {
-                ReconciliationService recon = reconciliation.getIfAvailable();
-                if (recon != null) {
-                    recon.reconcile(Trigger.POST_ORDER);
-                }
+                triggerPostOrderReconcile(barTs, decisionId);
             }
             return CycleOutcome.EXECUTED;
         } catch (ChainIncompleteException incomplete) {
             alerts.record("CHAIN_INCOMPLETE", barTs, Map.of(
                     "decisionId", decisionId, "reason", String.valueOf(incomplete.getMessage())));
             return CycleOutcome.NOOP_ALERTED;
+        }
+    }
+
+    /**
+     * 리뷰 수정 — 이 시점에 executor.execute()는 이미 성공 커밋을 마쳤다(주문 체인 자체는 완료).
+     * reconcile(POST_ORDER)이 던지는 어떤 예외(예: adjustment tx 내부의 orElseThrow)도 executeCycle의
+     * ChainIncompleteException 캐치에 흡수되지 않고 그대로 새면, 이미 성공한 사이클이
+     * CycleOutcome 없이 스케줄러 tick을 그대로 실패시킨다 — 대사 실패가 이미 끝난 거래의 성공
+     * 여부를 뒤집으면 안 되므로 별도로 격리해 알림만 남기고 EXECUTED를 유지한다.
+     */
+    private void triggerPostOrderReconcile(java.time.ZonedDateTime barTs, long decisionId) {
+        ReconciliationService recon = reconciliation.getIfAvailable();
+        if (recon == null) {
+            return;
+        }
+        try {
+            recon.reconcile(Trigger.POST_ORDER);
+        } catch (RuntimeException reconFailure) {
+            alerts.record("POST_ORDER_RECONCILE_FAILED", barTs, Map.of(
+                    "decisionId", decisionId, "reason", String.valueOf(reconFailure.getMessage())));
         }
     }
 

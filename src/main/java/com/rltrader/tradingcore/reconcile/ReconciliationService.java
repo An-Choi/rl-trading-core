@@ -194,7 +194,16 @@ public class ReconciliationService {
                 ChainNext.markCompleted(), null, TransitionMode.RECOVERY);
     }
 
-    /** 관찰 점프(CANCELLED, 잔량 있음) — brokerTerminal && cancelled. */
+    /**
+     * 관찰 점프(CANCELLED, 잔량 있음) — brokerTerminal && cancelled.
+     * 리뷰 수정 — SELL이고 잔량(qty − canonical filled)이 남아있으면 OrderLifecycleService의
+     * 정상 취소 경로와 동일하게 ChainNext.liquidation()으로 이월해야 한다(spec §10 이월 규칙).
+     * 무조건 markCompleted()로 커밋하면 decisions.execution_status가 COMPLETED로 확정되고
+     * liquidationPending도 false로 남아, LiquidationService.resume()의 유일한 스캐너가 이 잔량을
+     * 영구히 찾지 못한다 — "정상 경로와 동일 취급"이 대사 경로에서도 지켜져야 한다(spec §6).
+     * BUY 잔량은 정상 경로도 재시도 상한 도달 시 add를 포기하고 completed로 끝내므로(관찰 시점에는
+     * 재시도 여부를 판단할 attempt 컨텍스트가 없다) 대사는 안전하게 completed로 확정한다.
+     */
     private void finalizeObservedCancel(OrderEntity order, KisOrderSnapshot snap) {
         KisBalance balance = balanceOrNull();
         if (balance == null) {
@@ -202,8 +211,11 @@ public class ReconciliationService {
         }
         long delta = snap.cumulativeFilledQty() - order.getAccountedFilledQty();
         PortfolioState after = applyObservedFill(order, delta, balance);
+        long remaining = order.getQty() - snap.cumulativeFilledQty();
+        ChainNext next = order.getSide() == OrderSide.SELL && remaining > 0
+                ? ChainNext.liquidation() : ChainNext.markCompleted();
         finalization.finalizeChain(order, OrderStatus.CANCELLED, snap, after,
-                ChainNext.markCompleted(), null, TransitionMode.RECOVERY);
+                next, null, TransitionMode.RECOVERY);
     }
 
     private PortfolioState applyObservedFill(OrderEntity order, long deltaQty, KisBalance balance) {
