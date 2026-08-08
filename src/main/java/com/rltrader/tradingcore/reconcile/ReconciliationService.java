@@ -28,10 +28,12 @@ import com.rltrader.tradingcore.scheduler.CycleAdmissionGate;
 import java.math.BigDecimal;
 import java.math.RoundingMode;
 import java.time.Clock;
+import java.time.LocalDate;
 import java.time.OffsetDateTime;
 import java.time.ZonedDateTime;
 import java.util.ArrayList;
 import java.util.EnumSet;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -126,6 +128,20 @@ public class ReconciliationService {
         reconcileBalance(trigger, adjustmentApplied);
     }
 
+    /**
+     * 주문 레벨만 — Task 14 boot recovery(spec §7 ⑤) 전용 공개 진입점. 부팅 중 artifact 판정(⑦)이
+     * 끝나기 전에는 잔고 레벨(reconcileBalance)을 부르면 안 된다: 원본 스냅숏(복구 전, artifact
+     * 불일치일 수 있는 상태)의 로컬 shares를 KIS와 비교해 버리면 아직 확정되지 않은 mismatch를
+     * RECON_UNEXPLAINED로 오판·HALT할 수 있다(⑦이 내려야 할 판정을 ⑤가 가로채는 순서 오류).
+     * ⑨(최종 대사)는 여전히 {@link #reconcile(Trigger)}(order+balance 둘 다)를 그대로 쓴다 —
+     * reconcileOrders는 매 호출마다 "ORDER" 레벨 reconciliations 행을 남기므로(공유 로직 재사용,
+     * 별도 무기록 경로 신설 안 함) 정상 라이브 기동은 STARTUP 트리거로 이 행이 두 번(⑤에서 한 번,
+     * ⑨에서 재확인 한 번) 남는다 — 둘 다 감사 기록으로 유효하므로 억제하지 않는다.
+     */
+    public void reconcileOrdersOnly(Trigger trigger) {
+        reconcileOrders(trigger);
+    }
+
     // ---------------------------------------------------------------- 주문 레벨
 
     /**
@@ -133,6 +149,15 @@ public class ReconciliationService {
      * @return 이번 호출에서 adjustment를 하나라도 적용했는지 — 잔고 레벨의 "설명 가능" 판정에 쓰인다.
      */
     private boolean reconcileOrders(Trigger trigger) {
+        if (trigger == Trigger.STARTUP) {
+            // Task 14, spec §7 ⑤ — kis_order_no가 아직 없는(NEW·SUBMIT_UNKNOWN) 비종결 주문은
+            // 아래 메인 루프의 조회 대상이 아니다(주문번호가 없으면 broker.orderSnapshot을 부를
+            // 수 없다). 크래시 시점이 "제출 직후·커밋 직전"이었을 수 있으므로(부재는 증명이
+            // 아니다 — spec §3), 먼저 dailyOrders 차집합으로 채택을 시도한다: 성공하면
+            // kis_order_no가 채워져 바로 아래 메인 루프가 그대로 관찰 점프로 마무리한다(중복
+            // 구현 없이 흡수) — 실패(미발견·모호)면 재전송 없이 즉시 HALT + 기동 중단.
+            resolveOrphanedOrders();
+        }
         List<Map<String, Object>> detail = new ArrayList<>();
         boolean anySync = false;
 
@@ -188,6 +213,59 @@ public class ReconciliationService {
         } catch (KisTransportException e) {
             log.warn("[RECON] cancel request failed for order {} — retry next pass", order.getId(), e);
         }
+    }
+
+    /**
+     * Task 14, spec §7 ⑤ — kis_order_no가 아직 없는 비종결 주문(NEW·SUBMIT_UNKNOWN)의 해소.
+     * Task 11 resolveSubmitUnknown(OrderLifecycleService)과 동일한 차집합 절차를 재사용한다(브리프
+     * 지시 — "동일한 해소 절차", 별도 매칭 규칙 신설 금지): 그 주문의 tradingDate 기준
+     * dailyOrders 조회 → 로컬 orders가 이미 아는(그 날짜의) kis_order_no를 뺀 차집합.
+     * 1개 = 채택(kis_order_no 기록 + RECOVERY 전이로 ACKED 커밋) — 이후 이 메서드를 호출한
+     * reconcileOrders의 메인 루프가 그대로 이어받아 관찰 점프(FILLED/CANCELLED)로 마무리한다
+     * (finalizeObservedFill/finalizeObservedTerminalRemainder 재사용, 중복 구현 없음).
+     * 0개 또는 2개 이상 = 미발견·모호 — 재전송 없이 즉시 HaltService.raise + 예외로 기동을 중단한다.
+     * 폴링 반복은 하지 않는다(Task 11의 submitUnknownMaxLookups 루프는 진행 중인 라이브 체인의
+     * "잠시 후 나타날 수 있음"을 기다리는 것이지만, 부팅은 새 프로세스 시작 시점의 일회성
+     * 판정이다 — 여기서 발견 안 되면 사람이 봐야 한다).
+     */
+    private void resolveOrphanedOrders() {
+        List<OrderEntity> orphans = orders.findByStatusIn(NON_TERMINAL).stream()
+                .filter(o -> o.getKisOrderNo() == null)
+                .toList();
+        for (OrderEntity order : orphans) {
+            Set<String> known = knownKisOrderNos(order.getTradingDate());
+            List<KisOrderSnapshot> daily = broker.dailyOrders(order.getTradingDate());
+            List<KisOrderSnapshot> unknown = daily.stream()
+                    .filter(s -> s.kisOrderNo() != null && !known.contains(s.kisOrderNo()))
+                    .toList();
+            if (unknown.size() == 1) {
+                KisOrderSnapshot adopted = unknown.get(0);
+                order.setKisOrderNo(adopted.kisOrderNo());
+                order.setSubmittedAt(OffsetDateTime.now(clock));
+                finalization.transition(order, OrderStatus.ACKED,
+                        Map.of("kisOrderNo", adopted.kisOrderNo(), "adoptedAtBoot", true),
+                        TransitionMode.RECOVERY);
+            } else {
+                String reason = unknown.isEmpty() ? "not found at boot"
+                        : "ambiguous: " + unknown.size() + " unmatched orders";
+                halts.raise("SUBMIT_UNKNOWN", Map.of(
+                        "decisionId", order.getDecisionId(), "orderId", order.getId(),
+                        "tradingDate", order.getTradingDate().toString(), "reason", reason));
+                throw new IllegalStateException(
+                        "boot recovery: unresolved order " + order.getId() + " (" + reason + ")");
+            }
+        }
+    }
+
+    /** 당일(그 주문의 tradingDate) 로컬 orders가 아는(non-null) kis_order_no 집합 — 차집합의 기준. */
+    private Set<String> knownKisOrderNos(LocalDate tradingDate) {
+        Set<String> known = new HashSet<>();
+        for (OrderEntity o : orders.findAll()) {
+            if (tradingDate.equals(o.getTradingDate()) && o.getKisOrderNo() != null) {
+                known.add(o.getKisOrderNo());
+            }
+        }
+        return known;
     }
 
     /**
