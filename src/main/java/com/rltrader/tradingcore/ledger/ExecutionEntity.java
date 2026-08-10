@@ -6,6 +6,7 @@ import jakarta.persistence.GeneratedValue;
 import jakarta.persistence.GenerationType;
 import jakarta.persistence.Id;
 import jakarta.persistence.Table;
+import java.math.BigDecimal;
 import java.time.OffsetDateTime;
 
 @Entity
@@ -19,20 +20,23 @@ public class ExecutionEntity {
     @Column(name = "decision_id", nullable = false)
     private Long decisionId;
 
+    @Column(name = "order_id")
+    private Long orderId;
+
     @Column(name = "fill_price", nullable = false)
-    private double fillPrice;
+    private BigDecimal fillPrice;
 
     @Column(name = "shares_delta", nullable = false)
-    private double sharesDelta;
+    private BigDecimal sharesDelta;
 
     @Column(name = "units_after", nullable = false)
     private int unitsAfter;
 
     @Column(name = "shares_after", nullable = false)
-    private double sharesAfter;
+    private BigDecimal sharesAfter;
 
     @Column(name = "cash_after", nullable = false)
-    private double cashAfter;
+    private BigDecimal cashAfter;
 
     @Column(name = "created_at", nullable = false, insertable = false, updatable = false)
     private OffsetDateTime createdAt;
@@ -53,20 +57,28 @@ public class ExecutionEntity {
         this.decisionId = decisionId;
     }
 
-    public double getFillPrice() {
+    public Long getOrderId() {
+        return orderId;
+    }
+
+    public void setOrderId(Long orderId) {
+        this.orderId = orderId;
+    }
+
+    public BigDecimal getFillPrice() {
         return fillPrice;
     }
 
     public void setFillPrice(double fillPrice) {
-        this.fillPrice = fillPrice;
+        this.fillPrice = BigDecimal.valueOf(fillPrice);
     }
 
-    public double getSharesDelta() {
+    public BigDecimal getSharesDelta() {
         return sharesDelta;
     }
 
     public void setSharesDelta(double sharesDelta) {
-        this.sharesDelta = sharesDelta;
+        this.sharesDelta = BigDecimal.valueOf(sharesDelta);
     }
 
     public int getUnitsAfter() {
@@ -77,20 +89,20 @@ public class ExecutionEntity {
         this.unitsAfter = unitsAfter;
     }
 
-    public double getSharesAfter() {
+    public BigDecimal getSharesAfter() {
         return sharesAfter;
     }
 
     public void setSharesAfter(double sharesAfter) {
-        this.sharesAfter = sharesAfter;
+        this.sharesAfter = BigDecimal.valueOf(sharesAfter);
     }
 
-    public double getCashAfter() {
+    public BigDecimal getCashAfter() {
         return cashAfter;
     }
 
     public void setCashAfter(double cashAfter) {
-        this.cashAfter = cashAfter;
+        this.cashAfter = BigDecimal.valueOf(cashAfter);
     }
 
     public OffsetDateTime getCreatedAt() {

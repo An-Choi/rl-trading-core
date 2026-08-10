@@ -14,12 +14,21 @@ import java.util.List;
 import java.util.Map;
 import org.junit.jupiter.api.Test;
 import org.mockito.InOrder;
+import org.springframework.beans.factory.ObjectProvider;
 
 class BootSequenceTest {
 
     private static TradingProperties props(int readyWaitSeconds) {
         return new TradingProperties("005930", "http://x", 20, 5, 10_000.0, 10_000.0,
                 5000, 240_000, 5000, readyWaitSeconds);
+    }
+
+    /** dry-run 프로파일 동형 — live 전용 빈(BootRecoveryService)이 없는 ObjectProvider. */
+    @SuppressWarnings("unchecked")
+    private static ObjectProvider<BootRecoveryService> emptyRecoveryProvider() {
+        ObjectProvider<BootRecoveryService> provider = mock(ObjectProvider.class);
+        when(provider.getIfAvailable()).thenReturn(null);
+        return provider;
     }
 
     private static MetadataResponse validMeta() {
@@ -35,7 +44,7 @@ class BootSequenceTest {
         PredictClient predict = mock(PredictClient.class);
         when(predict.ready()).thenReturn(false);
         BootSequence boot = new BootSequence(predict, mock(DecisionCycleService.class),
-                mock(PortfolioManager.class), props(0));
+                mock(PortfolioManager.class), props(0), emptyRecoveryProvider());
         assertThatThrownBy(boot::prepare)
                 .isInstanceOf(IllegalStateException.class).hasMessageContaining("not ready");
     }
@@ -47,7 +56,7 @@ class BootSequenceTest {
         when(predict.metadata()).thenReturn(validMeta());
         DecisionCycleService cycle = mock(DecisionCycleService.class);
         PortfolioManager portfolio = mock(PortfolioManager.class);
-        BootSequence boot = new BootSequence(predict, cycle, portfolio, props(5));
+        BootSequence boot = new BootSequence(predict, cycle, portfolio, props(5), emptyRecoveryProvider());
         ArtifactContext ctx = boot.prepare();
         assertThat(ctx.artifactId()).isEqualTo("ppo-fs3-x");
         InOrder order = inOrder(portfolio, cycle);       // 복원 → 초기화 순서 보장
@@ -65,7 +74,7 @@ class BootSequenceTest {
         when(predict.metadata()).thenReturn(bad);
         DecisionCycleService cycle = mock(DecisionCycleService.class);
         PortfolioManager portfolio = mock(PortfolioManager.class);
-        BootSequence boot = new BootSequence(predict, cycle, portfolio, props(5));
+        BootSequence boot = new BootSequence(predict, cycle, portfolio, props(5), emptyRecoveryProvider());
         assertThatThrownBy(boot::prepare).isInstanceOf(IllegalStateException.class);
         verifyNoInteractions(portfolio, cycle);          // 검증 실패 시 복원·초기화 미실행
         // (StartupRunner는 prepare() 예외로 scheduler.enable()에 도달하지 못한다)

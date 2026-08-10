@@ -10,6 +10,22 @@ spring:
   flyway:
     enabled: true
 
+kis:
+  base-url: https://openapivts.koreainvestment.com:29443
+  app-key: ${KIS_APP_KEY:}
+  app-secret: ${KIS_APP_SECRET:}
+  account-no: ${KIS_ACCOUNT_NO:}
+  account-product-code: "01"
+  connect-timeout-ms: 3000
+  read-timeout-ms: 10000        # ack 타임아웃 겸용 — 실측 후 확정
+order:
+  fill-poll-interval-ms: 2000
+  fill-timeout-ms: 60000
+  closing-auction-deadline: "15:35"
+  submit-retry-max: 1
+  reject-retry-max: 3
+  submit-unknown-max-lookups: 5
+  recon-interval-ms: 30000
 trading:
   symbol: "005930"
   predict-base-url: "http://127.0.0.1:8000"

@@ -1,0 +1,39 @@
+# application-live.yml
+# 실거래 프로파일 설정 문서화 파일
+#
+# 참고: 이 파일의 값들은 application.yml의 기본값과 동일합니다.
+# 실제 활성화는 --spring.profiles.active=live + 환경 변수(KIS_APP_KEY, KIS_APP_SECRET, KIS_ACCOUNT_NO)로
+# 이루어집니다. 이 파일은 문서화 목적이며 중복 정의가 아닙니다.
+
+# KIS 모의투자 API 설정 (실측 후 확정 항목 표시)
+kis:
+  base-url: https://openapivts.koreainvestment.com:29443  # KIS 모의투자 endpoint
+  app-key: ${KIS_APP_KEY:}                                 # 환경 변수에서 주입 (모의투자 앱키)
+  app-secret: ${KIS_APP_SECRET:}                           # 환경 변수에서 주입 (모의투자 앱시크릿)
+  account-no: ${KIS_ACCOUNT_NO:}                           # 환경 변수에서 주입 (모의투자 계좌번호 — 전략 전용 계좌 전제)
+  account-product-code: "01"                               # 일반 계좌 상품 코드
+  connect-timeout-ms: 3000                                 # KIS 커넥션 타임아웃 (ms)
+  read-timeout-ms: 10000                                   # ※ 실측 필요: ack 타임아웃 값 확정 후 반영
+
+# 주문 실행 설정
+order:
+  fill-poll-interval-ms: 2000                              # 체결 폴링 간격 (ms)
+  fill-timeout-ms: 60000                                   # ※ 실측 필요: 체결 지연 분포 측정 후 값 확정
+  closing-auction-deadline: "15:35"                        # 장 마감 경매 데드라인
+  submit-retry-max: 1                                      # 주문 제출 재시도 횟수
+  reject-retry-max: 3                                      # 거부 사유별 재시도 횟수
+  submit-unknown-max-lookups: 5                            # SUBMIT_UNKNOWN 상태 조회 최대 횟수
+  recon-interval-ms: 30000                                 # 주기적 대사 간격 (ms)
+
+# 트레이딩 운영 설정
+trading:
+  symbol: "005930"                                         # 거래 종목 코드 (삼성전자)
+  predict-base-url: "http://127.0.0.1:8000"                # predict 서버 base URL
+  delay-seconds: 20                                        # 매 5분 bar 후 주문 발화 지연 (초, 0~59)
+  max-units-cap: 5                                         # 아티팩트 max_units 운영 상한 (units)
+  max-capital-cap: 10000.0                                 # 풀 포지션 명목가 상한 (KRW, Spring hard cap)
+  dry-run-initial-cash: 10000.0                            # 신규 포트폴리오 초기 현금 (dry-run 전용)
+  connect-timeout-ms: 5000                                 # predict 서버 커넥션 타임아웃 (ms)
+  read-timeout-ms: 240000                                  # /predict 전용 read timeout (ms, KIS fetch 최악 ~208초 고려)
+  control-timeout-ms: 5000                                 # /ready, /metadata 전용 read timeout (ms)
+  ready-wait-max-seconds: 60                               # 기동 시 /ready 대기 최대 시간 (초)

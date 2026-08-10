@@ -98,6 +98,177 @@ SPRING_PROFILES_ACTIVE=smoke ./gradlew bootRun
 | `smoke.bars` | 실행할 bar 개수 (마지막 bar `15:20`에서 절단) | `6` |
 | `smoke.mode` | `replay`(기본) 또는 `restore-only` — enum 바인딩이라 오타는 조용히 넘어가지 않고 기동 실패 | `replay` |
 
+## Live Smoke (실거래 모의투자 E2E 검증)
+
+실거래 환경에서 실제 모의투자 서버와 통신하는 end-to-end 검증 절차입니다. **주의: 장 시간(09:30~15:30)에만
+실행 가능하며, 실제 주문이 시스템에 제출됩니다(모의투자 서버이지만 실제 계좌 영향).**
+
+### 준비 단계
+
+1. **환경 변수 설정** (모의투자 앱키/시크릿/계좌)
+   ```bash
+   export KIS_APP_KEY="모의투자_앱키"
+   export KIS_APP_SECRET="모의투자_앱시크릿"
+   export KIS_ACCOUNT_NO="모의투자_계좌번호"  # 전략 전용 전제 계좌 (format: XXXXXXXX01)
+   ```
+
+2. **Docker & Flyway 자동 시작**
+   ```bash
+   docker compose up -d postgres
+   # Flyway는 Spring 기동 시 자동 마이그레이션
+   ```
+
+3. **Predict 서버 기동 확인** (별도 프로세스)
+   ```bash
+   curl http://127.0.0.1:8000/ready
+   # 200 OK 반환 확인 필수
+   ```
+
+4. **Live 프로파일으로 기동**
+   ```bash
+   ./gradlew bootRun --args="--spring.profiles.active=live"
+   ```
+
+### 기동 시퀀스 검증 (로그 확인)
+
+기동 후 다음 로그를 순서대로 확인합니다 (약 1-3분 소요):
+
+```
+handshake ok (live): artifact=<artifact_id> fs=<feature_schema_version>
+artifact mismatch (...) but KIS holding is 0 — resetting to flat
+(또는: handshake ok: artifact=... fs=... // dry-run 경로)
+```
+
+**기동 중단되는 경우** (이 경우 원인 확인 필수):
+- `IllegalStateException: predict server not ready within <N>s` — predict 서버 `/ready`가 응답하지 않음
+- `assertNoActiveHalt()` 예외 메시지 + 코드 — DB에 active HALT가 있음 (수동으로 `halts.cleared_at` 입력 후 재기동)
+- `IllegalStateException: boot chain invariant violated for decision <id>` — IN_PROGRESS 결정에 실행 주체 없음 (복구 실패)
+- `IllegalStateException: artifact mismatch with real holdings (<N>) — boot halted` — 아티팩트 불일치 + 실보유 있음 (spec §7 ⑦)
+
+### 실거래 체결 검증 (장중 10:05 이후 권장)
+
+1. **결정 사이클 자동 발화 대기**
+   - 기동 후 첫 5분 grid(예: 10:05, 10:10, ...)에서 자동 발화
+   - 또는 수동 트리거 (별도 엔드포인트 있으면 호출, 아니면 대기)
+
+2. **주문 제출 확인** (logs or DB)
+   ```sql
+   SELECT id, side, qty, order_type, status, avg_fill_price, submitted_at 
+   FROM orders 
+   WHERE created_at > now() - interval '5 minutes'
+   ORDER BY created_at DESC;
+   ```
+
+3. **Add 주문 체결 확인** (1회 이상)
+   ```sql
+   -- 주문 상태
+   SELECT id, side, qty, order_type, status, avg_fill_price, submitted_at 
+   FROM orders WHERE side = 'BUY' AND created_at > now() - interval '1 hour'
+   LIMIT 1;
+   
+   -- 체결 이벤트
+   SELECT id, order_id, from_status, to_status, created_at 
+   FROM order_events WHERE order_id = <order_id>
+   ORDER BY created_at;
+   
+   -- 실제 체결
+   SELECT id, order_id, fill_price, shares_delta, created_at 
+   FROM executions WHERE order_id = <order_id>;
+   
+   -- 포트폴리오 스냅샷
+   SELECT symbol, units, shares, cash, entry_bar_ts, updated_at 
+   FROM portfolio_snapshots 
+   WHERE symbol = '005930';
+   ```
+
+4. **Clear 주문 체결 확인** (1회 이상)
+   ```sql
+   -- Clear 주문 (SELL)
+   SELECT id, side, qty, order_type, status, avg_fill_price, submitted_at 
+   FROM orders WHERE side = 'SELL' AND created_at > now() - interval '1 hour'
+   LIMIT 1;
+   
+   -- 대사 레코드
+   SELECT id, trigger_source, level, result, created_at 
+   FROM reconciliations 
+   ORDER BY created_at DESC LIMIT 5;
+   ```
+
+### 주문 지연 분석 (실측 기록)
+
+다음 SQL을 실행하여 시스템과 KIS 간의 지연을 측정합니다:
+
+```sql
+-- ack 타임아웃 확인 (orders.submitted_at ↔ order_events ACKED 상태 전이)
+SELECT 
+  o.id,
+  o.side,
+  o.qty,
+  o.submitted_at,
+  oe_ack.created_at as oe_acked_at,
+  EXTRACT(EPOCH FROM (oe_ack.created_at - o.submitted_at)) * 1000 as ack_delay_ms
+FROM orders o
+LEFT JOIN order_events oe_ack ON oe_ack.order_id = o.id 
+  AND oe_ack.to_status = 'ACKED'
+WHERE o.submitted_at > now() - interval '1 hour'
+ORDER BY o.submitted_at DESC;
+
+-- 체결 지연 분포 (submit → 첫 FILL)
+SELECT 
+  o.id,
+  o.side,
+  o.qty,
+  o.submitted_at,
+  oe_fill.created_at as filled_at,
+  EXTRACT(EPOCH FROM (oe_fill.created_at - o.submitted_at)) * 1000 as fill_delay_ms
+FROM orders o
+LEFT JOIN order_events oe_fill ON oe_fill.order_id = o.id
+  AND oe_fill.to_status = 'FILLED'
+WHERE o.submitted_at > now() - interval '1 hour'
+ORDER BY o.submitted_at DESC;
+```
+
+**기록할 항목** (스펙 §3, §5 초기값 확정용):
+- ① ack/fill 지연 분포 (평균, P95, 최대값 ms) → `kis.read-timeout-ms`, `order.fill-poll-interval-ms` 확정
+- ② 시장가 증증금 방식 (full position 근처 add 주문 거부 여부) → spec §5 `marketable-limit` 전환 트리거 검증
+- ③ 예수금 반영 지연 (주문 제출 후 잔액 반영까지 시간) → 스케줄러 재진입 가능 여부 판단용
+- ④ KIS TR ID, 취소 body 필드 명 (실제 응답과 코드 일치 여부) → "KIS 문서 재확인 필요" 주석 항목 검증
+- ⑤ 거부 사유 코드 분류 (clear 주문 REJECTED 재시도/이월/HALT 분기) → 에러 처리 로직 검증
+
+### 재기동 검증
+
+1. **데이터 보존 상태 확인**
+   ```sql
+   SELECT COUNT(*) FROM orders;
+   SELECT COUNT(*) FROM portfolio_snapshots;
+   SELECT COUNT(*) FROM reconciliations;
+   ```
+
+2. **재기동**
+   ```bash
+   ./gradlew bootRun --args="--spring.profiles.active=live"
+   ```
+
+3. **복원 & 대사 검증** (로그 + DB 확인)
+   - 로그: `handshake ok (live): artifact=... fs=...` 메시지 확인
+   - DB: reconciliations 테이블에서 최신 행의 `trigger_source = 'STARTUP'`, `result = 'CLEAN'` 확인
+   ```sql
+   SELECT id, trigger_source, level, result, created_at 
+   FROM reconciliations 
+   WHERE trigger_source = 'STARTUP'
+   ORDER BY created_at DESC LIMIT 1;
+   ```
+
+### 완료 기준
+
+스모크 통과 = 다음 조건 만족:
+- ✓ 기동 시퀀스 HALT 없이 완료
+- ✓ Add 주문 1회 체결 확인 (order → order_events → executions 테이블 데이터 존재)
+- ✓ Clear 주문 1회 체결 확인 (portfolio_snapshots, reconciliations 데이터 생성)
+- ✓ 재기동 후 복원 상태 검증 (STARTUP reconciliation CLEAN)
+
+**다음 단계**: websocket 기반 실시간 업데이트(구현 2단계)는 별도 계획.
+
 ## 테스트
 
 ```bash

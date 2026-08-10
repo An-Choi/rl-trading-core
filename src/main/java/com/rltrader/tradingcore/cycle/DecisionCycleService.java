@@ -5,6 +5,7 @@ import com.rltrader.tradingcore.domain.PortfolioState;
 import com.rltrader.tradingcore.domain.TradeAction;
 import com.rltrader.tradingcore.execution.ExecutionPort;
 import com.rltrader.tradingcore.execution.FillResult;
+import com.rltrader.tradingcore.halt.TradingHaltState;
 import com.rltrader.tradingcore.ledger.*;
 import com.rltrader.tradingcore.portfolio.PortfolioManager;
 import com.rltrader.tradingcore.predict.*;
@@ -17,6 +18,7 @@ import java.util.Optional;
 import java.util.concurrent.atomic.AtomicBoolean;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.support.TransactionTemplate;
@@ -45,9 +47,10 @@ public class DecisionCycleService {
     private final TradingProperties props;
     private final ObjectMapper mapper;
     private final java.time.Clock clock;
+    private final TradingHaltState haltState;
+    private final ObjectProvider<LiveCycleOrchestrator> liveOrchestrator;
 
     private volatile ArtifactContext ctx;
-    private final AtomicBoolean halted = new AtomicBoolean(false);
     private final AtomicBoolean failNextExecutionInsert = new AtomicBoolean(false);   // 테스트 훅
     private final AtomicBoolean corruptNextExecutionFk = new AtomicBoolean(false);    // 테스트 훅 (FK 위반 강제)
 
@@ -55,7 +58,8 @@ public class DecisionCycleService {
             ExecutionPort executor, AlertRecorder alerts, DecisionRepository decisions,
             ExecutionRepository executions, PortfolioSnapshotRepository snapshots,
             TransactionTemplate tx, TradingProperties props, ObjectMapper strictMapper,
-            java.time.Clock clock) {
+            java.time.Clock clock, TradingHaltState haltState,
+            ObjectProvider<LiveCycleOrchestrator> liveOrchestrator) {
         this.predict = predict;
         this.portfolio = portfolio;
         this.executor = executor;
@@ -67,6 +71,8 @@ public class DecisionCycleService {
         this.props = props;
         this.mapper = strictMapper;
         this.clock = clock;
+        this.haltState = haltState;
+        this.liveOrchestrator = liveOrchestrator;
     }
 
     static boolean isDuplicateDecision(DataIntegrityViolationException e) {
@@ -76,10 +82,13 @@ public class DecisionCycleService {
 
     public void initialize(ArtifactContext ctx) {
         this.ctx = ctx;
-        this.halted.set(false);
+        // 인메모리 halted를 TradingHaltState로 이관(Task 12) — 이 컴포넌트는 재시작-해제형
+        // (halts 테이블 미기록)이 아니라 프로세스 수명 동안 지속되는 상태이므로, initialize()가
+        // 매번 halted를 리셋하지는 않는다(과거 AtomicBoolean과 동일한 계약 유지 — 테스트가
+        // reset()에서 매번 새 cycle을 만들거나 halted를 false로 되돌릴 필요가 없도록).
     }
 
-    public boolean isHalted() { return halted.get(); }
+    public boolean isHalted() { return haltState.isHalted(); }
 
     public void failNextExecutionInsertForTest() { failNextExecutionInsert.set(true); }
 
@@ -104,7 +113,15 @@ public class DecisionCycleService {
             var v = violation.get();
             alerts.record(v.alertCode(), scheduledBar, Map.of("reason", v.reason()));
             if (v.alertCode().equals("ARTIFACT_CHANGED")) {
-                halted.set(true);   // 캐시된 env_params가 낡음 — 신규 결정 전면 중단 (spec §2)
+                // 캐시된 env_params가 낡음 — 신규 결정 전면 중단 (spec §2). haltState.halt()를
+                // HaltService.raise를 거치지 않고 직접 호출한다 — 이 프로세스 안에서는 여전히
+                // 되돌릴 수 없지만, halts 테이블에는 의도적으로 기록하지 않는다: 재시작(새 JVM)
+                // 은 TradingHaltState 빈을 새로 만들므로 halted=false로 다시 시작한다("재시작-
+                // 해제형"). HaltService.raise가 만드는 halts 행 기반 영속 HALT(재시작해도 유지,
+                // 수동 clear 필요)와는 의도적으로 다른 종류 — 콜백 배선도 없다(Task 7 순환 의존
+                // 차단). 두 종류의 구분은 TradingHaltState의 플래그가 아니라 halts 테이블
+                // 존재 여부로만 이루어진다(TradingHaltState Javadoc 참고).
+                haltState.halt();
                 return CycleOutcome.HALTED;
             }
             return CycleOutcome.NOOP_ALERTED;
@@ -118,8 +135,19 @@ public class DecisionCycleService {
             return CycleOutcome.NOOP_ALERTED;
         }
 
+        // live 위임 (Task 12): hold는 주문이 없으므로 1차 단일 tx 경로로 그대로 흘려보낸다
+        // (브리프 계약) — LiveCycleOrchestrator는 ADD_UNIT/CLEAR(주문이 실제로 생기는 액션)만
+        // 받는다. 검증·RiskGate를 통과한 뒤에만 위임한다.
+        LiveCycleOrchestrator live = liveOrchestrator.getIfAvailable();
+        if (live != null && action != TradeAction.HOLD) {
+            return live.executeCycle(response, action, state, scheduledBar, result.latencyMs(), ctx);
+        }
+
+        // dry-run 경로(및 live의 hold): decision INSERT는 아래 persistCycle(같은 tx)에서 일어나므로 이 시점엔
+        // 아직 decisionId가 없다 — DryRunExecutor는 이를 무시하므로 플레이스홀더(-1)를 넘긴다
+        // (live 경로는 LiveCycleOrchestrator가 tx1 커밋 후 실제 decisionId로 호출, Task 12).
         FillResult fill = executor.execute(action, state, response.barClose(),
-                scheduledBar, ctx);
+                scheduledBar, ctx, -1L);
         try {
             tx.executeWithoutResult(status -> persistCycle(response, action, fill,
                     result.latencyMs()));

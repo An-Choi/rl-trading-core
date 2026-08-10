@@ -6,11 +6,14 @@ import static org.mockito.Mockito.*;
 
 import com.rltrader.tradingcore.cycle.CycleOutcome;
 import com.rltrader.tradingcore.cycle.DecisionCycleService;
+import com.rltrader.tradingcore.execution.LiquidationService;
 import com.rltrader.tradingcore.ledger.AlertRecorder;
+import com.rltrader.tradingcore.ledger.OrderRepository;
 import java.time.Clock;
 import java.time.ZonedDateTime;
 import java.util.concurrent.CountDownLatch;
 import org.junit.jupiter.api.Test;
+import org.springframework.beans.factory.ObjectProvider;
 
 class DecisionSchedulerTest {
 
@@ -19,12 +22,26 @@ class DecisionSchedulerTest {
                 com.rltrader.tradingcore.domain.TradingGrid.KST);
     }
 
+    /** dry-run 프로파일 동형 — live 전용 빈이 없는 ObjectProvider(getIfAvailable() == null). */
+    @SuppressWarnings("unchecked")
+    private static <T> ObjectProvider<T> emptyProvider() {
+        ObjectProvider<T> provider = mock(ObjectProvider.class);
+        when(provider.getIfAvailable()).thenReturn(null);
+        return provider;
+    }
+
+    private static DecisionScheduler scheduler(DecisionCycleService cycle, AlertRecorder alerts, Clock clock) {
+        return new DecisionScheduler(cycle, alerts, clock, new CycleAdmissionGate(),
+                DecisionSchedulerTest.<OrderRepository>emptyProvider(),
+                DecisionSchedulerTest.<LiquidationService>emptyProvider());
+    }
+
     @Test
     void firesCycleForGridBar() {
         DecisionCycleService cycle = mock(DecisionCycleService.class);
         when(cycle.isHalted()).thenReturn(false);
         when(cycle.runCycle(any(), any())).thenReturn(CycleOutcome.EXECUTED);
-        DecisionScheduler scheduler = new DecisionScheduler(
+        DecisionScheduler scheduler = scheduler(
                 cycle, mock(AlertRecorder.class), fixedAt("2026-08-06T11:00:20"));
         scheduler.enable();
         scheduler.tick();
@@ -35,10 +52,10 @@ class DecisionSchedulerTest {
     @Test
     void skipsWhenNotEnabledOrHaltedOrOffGrid() {
         DecisionCycleService cycle = mock(DecisionCycleService.class);
-        DecisionScheduler notEnabled = new DecisionScheduler(
+        DecisionScheduler notEnabled = scheduler(
                 cycle, mock(AlertRecorder.class), fixedAt("2026-08-06T11:00:20"));
         notEnabled.tick();                                       // enable 전 — 무시
-        DecisionScheduler offGrid = new DecisionScheduler(
+        DecisionScheduler offGrid = scheduler(
                 cycle, mock(AlertRecorder.class), fixedAt("2026-08-06T15:40:20"));
         offGrid.enable();
         offGrid.tick();                                          // grid 밖 — 무시
@@ -57,7 +74,7 @@ class DecisionSchedulerTest {
             return CycleOutcome.EXECUTED;
         });
         AlertRecorder alerts = mock(AlertRecorder.class);
-        DecisionScheduler scheduler = new DecisionScheduler(
+        DecisionScheduler scheduler = scheduler(
                 cycle, alerts, fixedAt("2026-08-06T11:00:20"));
         scheduler.enable();
         Thread first = new Thread(scheduler::tick);
@@ -77,7 +94,7 @@ class DecisionSchedulerTest {
         RuntimeException boom = new IllegalStateException("boom");
         when(cycle.runCycle(any(), any())).thenThrow(boom);
         AlertRecorder alerts = mock(AlertRecorder.class);
-        DecisionScheduler scheduler = new DecisionScheduler(
+        DecisionScheduler scheduler = scheduler(
                 cycle, alerts, fixedAt("2026-08-06T11:00:20"));
         scheduler.enable();
 

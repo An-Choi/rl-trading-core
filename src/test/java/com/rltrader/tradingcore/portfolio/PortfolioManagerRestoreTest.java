@@ -43,6 +43,9 @@ class PortfolioManagerRestoreTest extends AbstractIntegrationTest {
         manager.restore(CTX);
         PortfolioState state = manager.current();
         assertThat(state.units()).isEqualTo(2);
+        // NUMERIC 왕복 무손실 확인 (spec §1 — DB가 회계의 진실, double은 관찰 투영)
+        assertThat(state.shares()).isEqualTo(0.05);
+        assertThat(state.cash()).isEqualTo(6_000.0);
         // 재시작 갭 복구: 진입 10:05 → 현재 bar 11:00이면 11
         assertThat(state.barsSinceEntry(
                 ZonedDateTime.parse("2026-08-06T11:00:00+09:00[Asia/Seoul]"))).isEqualTo(11);

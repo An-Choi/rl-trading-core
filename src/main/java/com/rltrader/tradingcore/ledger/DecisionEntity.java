@@ -50,6 +50,9 @@ public class DecisionEntity {
     @Column(name = "latency_ms")
     private Long latencyMs;
 
+    @Column(name = "execution_status", nullable = false, length = 16)
+    private String executionStatus = "COMPLETED";
+
     @Column(name = "created_at", nullable = false, insertable = false, updatable = false)
     private OffsetDateTime createdAt;
 
@@ -131,6 +134,14 @@ public class DecisionEntity {
 
     public void setLatencyMs(Long latencyMs) {
         this.latencyMs = latencyMs;
+    }
+
+    public String getExecutionStatus() {
+        return executionStatus;
+    }
+
+    public void setExecutionStatus(String executionStatus) {
+        this.executionStatus = executionStatus;
     }
 
     public OffsetDateTime getCreatedAt() {

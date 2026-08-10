@@ -7,5 +7,5 @@ import java.time.ZonedDateTime;
 
 public interface ExecutionPort {
     FillResult execute(TradeAction action, PortfolioState state,
-                       double barClose, ZonedDateTime barTs, ArtifactContext ctx);
+                       double barClose, ZonedDateTime barTs, ArtifactContext ctx, long decisionId);
 }
