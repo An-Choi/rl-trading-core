@@ -105,11 +105,22 @@ SPRING_PROFILES_ACTIVE=smoke ./gradlew bootRun
 
 ### 준비 단계
 
-1. **환경 변수 설정** (모의투자 앱키/시크릿/계좌)
+1. **시크릿 설정** — 둘 중 하나 (로컬 개발은 (a) 권장)
+
+   (a) **로컬 프로파일 파일** (git 추적 제외, jar 미포함 외부 경로):
+   `config/application-local.yml`에 값 기입 후 기동 시 `local` 프로파일 추가
+   ```yaml
+   kis:
+     app-key: "모의투자_앱키"
+     app-secret: "모의투자_앱시크릿"
+     account-no: "모의투자_계좌번호_앞8자리"  # 전략 전용 전제 계좌
+   ```
+
+   (b) **환경 변수** (컨테이너/배포 표준 — application.yml의 `${KIS_APP_KEY:}` 플레이스홀더가 읽음):
    ```bash
    export KIS_APP_KEY="모의투자_앱키"
    export KIS_APP_SECRET="모의투자_앱시크릿"
-   export KIS_ACCOUNT_NO="모의투자_계좌번호"  # 전략 전용 전제 계좌 (format: XXXXXXXX01)
+   export KIS_ACCOUNT_NO="모의투자_계좌번호_앞8자리"
    ```
 
 2. **Docker & Flyway 자동 시작**
@@ -124,9 +135,10 @@ SPRING_PROFILES_ACTIVE=smoke ./gradlew bootRun
    # 200 OK 반환 확인 필수
    ```
 
-4. **Live 프로파일으로 기동**
+4. **Live 프로파일으로 기동** (로컬 파일 방식이면 `local` 프로파일 추가)
    ```bash
-   ./gradlew bootRun --args="--spring.profiles.active=live"
+   ./gradlew bootRun --args="--spring.profiles.active=live,local"
+   # 환경 변수 방식이면: --spring.profiles.active=live
    ```
 
 ### 기동 시퀀스 검증 (로그 확인)
