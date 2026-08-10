@@ -254,9 +254,16 @@ public class KisBrokerClient implements BrokerPort {
         String cnclYn = strictText(row.path("cncl_yn"), "cncl_yn");
         boolean cancelled = "Y".equals(cnclYn);
         boolean brokerTerminal = (rmnQty == 0) || cancelled;
-        // 방어적 파싱 — 필드 부재/공백이면 null(ackFrom과 동일 규칙, Fix A 2차 리뷰). 복구·채택
-        // 경로가 제출 ack 없이 이 조회만으로 주문을 알게 될 때 org no의 유일한 출처가 된다.
-        String krxFwdgOrdOrgno = orNullIfBlank(textOrNull(row.path("krx_fwdg_ord_orgno")));
+        // 방어적 파싱 — 필드 부재/공백이면 null(Fix A 2차 리뷰). 복구·채택 경로가 제출 ack 없이
+        // 이 조회만으로 주문을 알게 될 때 org no의 유일한 출처가 된다.
+        // Fix(3차 리뷰) — 일별주문체결(inquire-daily-ccld) 공식 스키마의 조직번호 필드는
+        // ord_gno_brno다(제출 ack의 output.KRX_FWDG_ORD_ORGNO와는 다른 필드/응답 — 혼동 금지).
+        // krx_fwdg_ord_orgno는 이 조회 응답에는 존재하지 않는 필드였다 — 방어적 폴백으로만 유지
+        // (실응답에 실제로 없는 것으로 스모크에서 확인되면 제거).
+        String krxFwdgOrdOrgno = orNullIfBlank(textOrNull(row.path("ord_gno_brno")));
+        if (krxFwdgOrdOrgno == null) {
+            krxFwdgOrdOrgno = orNullIfBlank(textOrNull(row.path("krx_fwdg_ord_orgno")));
+        }
         return new KisOrderSnapshot(odno, orderQty, filledQty, avgPrice, brokerTerminal, cancelled,
                 krxFwdgOrdOrgno);
     }

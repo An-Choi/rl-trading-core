@@ -101,6 +101,38 @@ class KisBrokerClientTest {
         assertThat(list.get(1).cumulativeAvgPrice()).isEqualByComparingTo(new BigDecimal("99.5"));
     }
 
+    // Fix(3차 리뷰, P1) — 일별주문체결(inquire-daily-ccld) 공식 스키마의 조직번호 필드는
+    // ord_gno_brno다(제출 ack의 KRX_FWDG_ORD_ORGNO와는 다른 필드). 실제 JSON 파싱 경로를 거쳐야
+    // 이 필드명 버그를 잡을 수 있다 — KisOrderSnapshot을 직접 생성하는 테스트는 이 경로를
+    // 검증하지 못한다.
+    @Test
+    void daily_orders_reads_org_no_from_ord_gno_brno() {
+        wm.stubFor(get(urlPathEqualTo("/uapi/domestic-stock/v1/trading/inquire-daily-ccld"))
+                .willReturn(okJson("""
+                    {"rt_cd":"0","ctx_area_fk100":"","ctx_area_nk100":"",
+                     "output1":[{"odno":"01","ord_qty":"10","tot_ccld_qty":"10",
+                                 "avg_prvs":"100.0","rmn_qty":"0","cncl_yn":"N",
+                                 "ord_gno_brno":"05360"}]}""")
+                        .withHeader("tr_cont", "D")));
+        var list = client.dailyOrders(LocalDate.of(2026, 8, 7));
+        assertThat(list).hasSize(1);
+        assertThat(list.get(0).krxFwdgOrdOrgno()).isEqualTo("05360");
+    }
+
+    // ord_gno_brno가 없으면(부재/공백) null — 공식 스키마상 필드가 없는 경우를 대비한 방어적 파싱.
+    @Test
+    void daily_orders_without_org_no_field_parses_as_null() {
+        wm.stubFor(get(urlPathEqualTo("/uapi/domestic-stock/v1/trading/inquire-daily-ccld"))
+                .willReturn(okJson("""
+                    {"rt_cd":"0","ctx_area_fk100":"","ctx_area_nk100":"",
+                     "output1":[{"odno":"01","ord_qty":"10","tot_ccld_qty":"10",
+                                 "avg_prvs":"100.0","rmn_qty":"0","cncl_yn":"N"}]}""")
+                        .withHeader("tr_cont", "D")));
+        var list = client.dailyOrders(LocalDate.of(2026, 8, 7));
+        assertThat(list).hasSize(1);
+        assertThat(list.get(0).krxFwdgOrdOrgno()).isNull();
+    }
+
     @Test
     void balance_maps_holding_and_cash() {
         wm.stubFor(get(urlPathEqualTo("/uapi/domestic-stock/v1/trading/inquire-balance"))
