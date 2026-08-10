@@ -53,6 +53,7 @@ class OrderLifecycleCancelRetryTest extends AbstractIntegrationTest {
     @Autowired AlertRepository alerts;
     @Autowired Clock clock;
     @Autowired com.rltrader.tradingcore.portfolio.PortfolioManager portfolioManager;
+    @Autowired HaltRepository halts;
     @MockitoBean BrokerPort broker;
 
     @org.junit.jupiter.api.BeforeEach
@@ -63,6 +64,7 @@ class OrderLifecycleCancelRetryTest extends AbstractIntegrationTest {
         decisions.deleteAll();
         snapshots.deleteAll();
         alerts.deleteAll();
+        halts.deleteAll();
         portfolioManager.apply(PortfolioState.flat(10_000));
     }
 
@@ -78,9 +80,9 @@ class OrderLifecycleCancelRetryTest extends AbstractIntegrationTest {
     void timeout_cancels_then_retries_once_in_same_finalization_tx() {
         long d = decisionWithNewOrder(10);
         when(broker.submitMarketOrder("005930", OrderSide.BUY, 10))
-                .thenReturn(new KisOrderAck("0001"));
+                .thenReturn(new KisOrderAck("0001", "05360"));
         when(broker.submitMarketOrder("005930", OrderSide.BUY, 7))
-                .thenReturn(new KisOrderAck("0002"));
+                .thenReturn(new KisOrderAck("0002", "05360"));
         // attempt 1: 폴링 1회차 부분(3주) → clock 전진(61s) → 데드라인 도달 → 취소 흐름
         when(broker.orderSnapshot(eq("0001"), any(LocalDate.class)))
                 .thenAnswer(inv -> {
@@ -121,9 +123,9 @@ class OrderLifecycleCancelRetryTest extends AbstractIntegrationTest {
     void retry_also_partial_gives_up_with_partial_unit_alert() {
         long d = decisionWithNewOrder(10);
         when(broker.submitMarketOrder("005930", OrderSide.BUY, 10))
-                .thenReturn(new KisOrderAck("0001"));
+                .thenReturn(new KisOrderAck("0001", "05360"));
         when(broker.submitMarketOrder("005930", OrderSide.BUY, 7))
-                .thenReturn(new KisOrderAck("0002"));
+                .thenReturn(new KisOrderAck("0002", "05360"));
         // attempt 1: 3주 후 취소 (잔량 7)
         when(broker.orderSnapshot(eq("0001"), any(LocalDate.class)))
                 .thenAnswer(inv -> {
@@ -163,7 +165,7 @@ class OrderLifecycleCancelRetryTest extends AbstractIntegrationTest {
     void zero_fill_chain_leaves_portfolio_unchanged() {
         long d = decisionWithNewOrder(10);
         when(broker.submitMarketOrder("005930", OrderSide.BUY, 10))
-                .thenReturn(new KisOrderAck("0001"), new KisOrderAck("0002"));
+                .thenReturn(new KisOrderAck("0001", "05360"), new KisOrderAck("0002", "05360"));
         // attempt 1: 0주 체결 후 취소
         when(broker.orderSnapshot(eq("0001"), any(LocalDate.class)))
                 .thenAnswer(inv -> {
@@ -197,7 +199,7 @@ class OrderLifecycleCancelRetryTest extends AbstractIntegrationTest {
     void fill_wins_cancel_race() {
         long d = decisionWithNewOrder(10);
         when(broker.submitMarketOrder("005930", OrderSide.BUY, 10))
-                .thenReturn(new KisOrderAck("0001"));
+                .thenReturn(new KisOrderAck("0001", "05360"));
         // 폴링: 타임아웃까지 미체결 후보 없음 → 데드라인 도달 → CANCEL_PENDING 커밋 →
         // 취소 확정 조회가 "전량 체결·취소 아님"을 반환 (레이스)
         when(broker.orderSnapshot(eq("0001"), any(LocalDate.class)))
@@ -234,9 +236,9 @@ class OrderLifecycleCancelRetryTest extends AbstractIntegrationTest {
     void poll_observed_cancelled_skips_recancel_and_finalizes_with_partial_policy() {
         long d = decisionWithNewOrder(10);
         when(broker.submitMarketOrder("005930", OrderSide.BUY, 10))
-                .thenReturn(new KisOrderAck("0001"));
+                .thenReturn(new KisOrderAck("0001", "05360"));
         when(broker.submitMarketOrder("005930", OrderSide.BUY, 7))
-                .thenReturn(new KisOrderAck("0002"));
+                .thenReturn(new KisOrderAck("0002", "05360"));
         // attempt 1: 3주 체결 후 타임아웃 -> 정상 취소 흐름(취소 요청 O) -> 잔량 7, 재시도.
         when(broker.orderSnapshot(eq("0001"), any(LocalDate.class)))
                 .thenAnswer(inv -> {
@@ -284,9 +286,9 @@ class OrderLifecycleCancelRetryTest extends AbstractIntegrationTest {
     void in_process_chain_total_includes_prior_attempt_fills() {
         long d = decisionWithNewOrder(10);
         when(broker.submitMarketOrder("005930", OrderSide.BUY, 10))
-                .thenReturn(new KisOrderAck("0001"));
+                .thenReturn(new KisOrderAck("0001", "05360"));
         when(broker.submitMarketOrder("005930", OrderSide.BUY, 7))
-                .thenReturn(new KisOrderAck("0002"));
+                .thenReturn(new KisOrderAck("0002", "05360"));
         // attempt 1: 3주 체결 후 취소 (잔량 7)
         when(broker.orderSnapshot(eq("0001"), any(LocalDate.class)))
                 .thenAnswer(inv -> {
@@ -341,7 +343,7 @@ class OrderLifecycleCancelRetryTest extends AbstractIntegrationTest {
         orders.save(attempt2);
 
         when(broker.submitMarketOrder("005930", OrderSide.BUY, 7))
-                .thenReturn(new KisOrderAck("0002"));
+                .thenReturn(new KisOrderAck("0002", "05360"));
         // attempt 2: 전량 미체결 후 취소 (잔량 포기, submitRetryMax=1이므로 재시도 없음)
         when(broker.orderSnapshot(eq("0002"), any(LocalDate.class)))
                 .thenAnswer(inv -> {
@@ -368,9 +370,9 @@ class OrderLifecycleCancelRetryTest extends AbstractIntegrationTest {
     void intermediate_finalization_keeps_memory_in_sync_on_later_failure() {
         long d = decisionWithNewOrder(10);
         when(broker.submitMarketOrder("005930", OrderSide.BUY, 10))
-                .thenReturn(new KisOrderAck("0001"));
+                .thenReturn(new KisOrderAck("0001", "05360"));
         when(broker.submitMarketOrder("005930", OrderSide.BUY, 7))
-                .thenReturn(new KisOrderAck("0002"));
+                .thenReturn(new KisOrderAck("0002", "05360"));
         // attempt 1: 3주 체결 후 취소 (잔량 7) — 이 finalization은 정상 커밋된다
         when(broker.orderSnapshot(eq("0001"), any(LocalDate.class)))
                 .thenAnswer(inv -> {
@@ -402,5 +404,68 @@ class OrderLifecycleCancelRetryTest extends AbstractIntegrationTest {
         OrderEntity attempt2 = orders.findTopByDecisionIdOrderByAttemptDesc(d).orElseThrow();
         assertThat(attempt2.getStatus().isTerminal()).isFalse();   // 비종결 유지 — 복구 대상
         assertThat(decisions.findById(d).orElseThrow().getExecutionStatus()).isEqualTo("IN_PROGRESS");
+    }
+
+    /**
+     * Fix A(2차 리뷰, P1) — 제출 ack에 KRX_FWDG_ORD_ORGNO가 없고(null) 이후 폴링 스냅숏에도 한
+     * 번도 채워지지 않은 채 타임아웃에 도달하면, cancelOrder POST를 보내지 않고 즉시
+     * HALT(CANCEL_ORGNO_MISSING) + ChainIncompleteException — 공백 전송 금지(공식 계약상 필수·
+     * 비공백 필드, blank 전송은 반복 거부로 이어져 체인이 고착된다).
+     */
+    @Test
+    void cancel_without_org_no_halts_instead_of_sending_blank() {
+        long d = decisionWithNewOrder(10);
+        when(broker.submitMarketOrder("005930", OrderSide.BUY, 10))
+                .thenReturn(new KisOrderAck("0001"));   // org no 없음(null) — 단일 인자 편의 생성자
+        when(broker.orderSnapshot(eq("0001"), any(LocalDate.class)))
+                .thenAnswer(inv -> {
+                    mutableClock().advance(Duration.ofSeconds(61));
+                    // brokerTerminal/cancelled 모두 false — org no 필드도 없음(부재)
+                    return Optional.of(new KisOrderSnapshot("0001", 10, 3, new BigDecimal("101.0"), false, false));
+                });
+
+        assertThatThrownBy(() -> lifecycle.runChain(d, new OrderPlan(OrderSide.BUY, 10),
+                TestFixtures.bar("2026-08-07T09:35"), TestFixtures.flat(10_000), TestFixtures.ctx()))
+                .isInstanceOf(ChainIncompleteException.class);
+
+        verify(broker, never()).cancelOrder(anyString(), anyLong(), any());
+
+        assertThat(halts.findByClearedAtIsNull())
+                .anySatisfy(h -> assertThat(h.getCode()).isEqualTo("CANCEL_ORGNO_MISSING"));
+
+        OrderEntity order = orders.findTopByDecisionIdOrderByAttemptDesc(d).orElseThrow();
+        assertThat(order.getStatus().isTerminal()).isFalse();   // 비종결 유지 — 수동 개입 대상
+    }
+
+    /**
+     * Fix A 대응 — org no가 있으면(제출 ack에서 확보) 취소가 정상 전송된다. 회귀 방지용 대조군.
+     */
+    @Test
+    void cancel_with_org_no_sends_normally() {
+        long d = decisionWithNewOrder(10);
+        when(broker.submitMarketOrder("005930", OrderSide.BUY, 10))
+                .thenReturn(new KisOrderAck("0001", "05360"));
+        when(broker.submitMarketOrder("005930", OrderSide.BUY, 7))
+                .thenReturn(new KisOrderAck("0002", "05360"));
+        // attempt 1: 3주 체결 후 타임아웃 -> 취소(정상 전송, org no 있음) -> 잔량 7, 재시도.
+        when(broker.orderSnapshot(eq("0001"), any(LocalDate.class)))
+                .thenAnswer(inv -> {
+                    mutableClock().advance(Duration.ofSeconds(61));
+                    return Optional.of(new KisOrderSnapshot("0001", 10, 3, new BigDecimal("101.0"), false, false));
+                })
+                .thenReturn(Optional.of(new KisOrderSnapshot("0001", 10, 3, new BigDecimal("101.0"), true, true)));
+        // attempt 2(잔량 7, submitRetryMax=1 도달): 전량 체결.
+        when(broker.orderSnapshot(eq("0002"), any(LocalDate.class)))
+                .thenReturn(Optional.of(new KisOrderSnapshot("0002", 7, 7, new BigDecimal("101.5"), true, false)));
+        when(broker.balance())
+                .thenReturn(new KisBalance(3, new BigDecimal("9697.00")))
+                .thenReturn(new KisBalance(10, new BigDecimal("8987.50")));
+
+        lifecycle.runChain(d, new OrderPlan(OrderSide.BUY, 10),
+                TestFixtures.bar("2026-08-07T09:35"), TestFixtures.flat(10_000), TestFixtures.ctx());
+
+        // attempt1의 취소만 전송된다(attempt2는 전량 체결로 취소 경로 자체를 타지 않음).
+        verify(broker, times(1)).cancelOrder(eq("0001"), anyLong(), eq("05360"));
+        assertThat(halts.findByClearedAtIsNull()).isEmpty();
     }
 }

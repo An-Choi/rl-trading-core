@@ -98,6 +98,15 @@ class ReconciliationServiceTest extends AbstractIntegrationTest {
             RETURNING id""", Long.class, decisionId, SYMBOL, qty, kisOrderNo);
     }
 
+    /** NEW 주문(kis_order_no 없음) — 부팅 orphan 해소(resolveOrphanedOrders) 시나리오용. */
+    private long insertOrphanOrder(long decisionId, long qty) {
+        return jdbc.queryForObject("""
+            INSERT INTO orders (decision_id, attempt, trading_date, symbol, side, qty, order_type,
+                status, filled_qty, accounted_filled_qty, accounted_fill_notional)
+            VALUES (?, 1, CURRENT_DATE, ?, 'BUY', ?, 'MARKET', 'NEW', 0, 0, 0)
+            RETURNING id""", Long.class, decisionId, SYMBOL, qty);
+    }
+
     /** 비종결(ACKED) SELL 주문 — 이월(liquidation) 시나리오용, filled 0. */
     private long insertOpenSellOrder(long decisionId, String kisOrderNo, long qty) {
         return jdbc.queryForObject("""
@@ -191,6 +200,60 @@ class ReconciliationServiceTest extends AbstractIntegrationTest {
 
         assertThat(reconRows("ORDER")).hasSize(1);
         assertThat(reconRows("ORDER").get(0).get("result")).isEqualTo("SYNCED");
+    }
+
+    /**
+     * Fix A(2차 리뷰, P1) — 부팅 시 orphan(kis_order_no 없는 NEW) 주문이 dailyOrders 차집합으로
+     * 채택되면, kis_order_no뿐 아니라 그 스냅숏이 담고 있는 KRX_FWDG_ORD_ORGNO도 함께 저장돼야
+     * 한다 — 제출 ack가 없었던 경로이므로 이 조회가 org no의 유일한 출처다. 채택 후 메인 루프가
+     * 이어서 관찰 점프(FINALIZED_FILLED)로 마무리하는 것도 함께 검증한다.
+     */
+    @Test
+    void orphaned_order_adoption_at_boot_persists_org_no() {
+        long d = insertDecision();
+        long orderId = insertOrphanOrder(d, 10);
+        seedSnapshot(0, 0.0, 10_000.0);
+
+        LocalDate today = LocalDate.now();
+        when(broker.dailyOrders(today)).thenReturn(List.of(
+                new KisOrderSnapshot("K999", 10, 10, new BigDecimal("101.5"), true, false, "05360")));
+        when(broker.orderSnapshot(eq("K999"), any(LocalDate.class)))
+                .thenReturn(Optional.of(
+                        new KisOrderSnapshot("K999", 10, 10, new BigDecimal("101.5"), true, false, "05360")));
+        when(broker.balance()).thenReturn(new KisBalance(10, new BigDecimal("8985.00")));
+
+        recon.reconcile(Trigger.STARTUP);
+
+        Map<String, Object> order = jdbc.queryForMap("SELECT * FROM orders WHERE id = ?", orderId);
+        assertThat(order.get("kis_order_no")).isEqualTo("K999");
+        assertThat(order.get("krx_fwdg_ord_orgno")).isEqualTo("05360");
+        assertThat(order.get("status")).isEqualTo("FILLED");   // 채택 후 메인 루프가 관찰 점프로 마무리
+    }
+
+    /**
+     * Fix A(2차 리뷰, P1) — 대사 경로(requestCancel)의 취소 시점 가드. 비종결 관찰(잔량 있음,
+     * brokerTerminal=false)이 취소 요청으로 수렴하려는데 org no가 없으면(null) 공백을 전송하지
+     * 않는다 — HALT(CANCEL_ORGNO_MISSING) + cancelOrder POST never called, 주문은 비종결로 남는다.
+     */
+    @Test
+    void requestCancel_without_org_no_halts_instead_of_sending_blank() {
+        long d = insertDecision();
+        long orderId = insertOpenOrder(d, "K002", 10);   // org no 미저장(null) — insertOpenOrder는 세팅 안 함
+        seedSnapshot(0, 0.0, 10_000.0);
+
+        // 미체결 잔존(brokerTerminal=false) — requestCancel 분기로 수렴.
+        when(broker.orderSnapshot(eq("K002"), any(LocalDate.class)))
+                .thenReturn(Optional.of(new KisOrderSnapshot("K002", 10, 4, new BigDecimal("100.0"), false, false)));
+        when(broker.balance()).thenReturn(new KisBalance(0, new BigDecimal("10000.00")));
+
+        recon.reconcile(Trigger.PERIODIC);
+
+        verify(broker, never()).cancelOrder(anyString(), anyLong(), any());
+        assertThat(halts.findByClearedAtIsNull())
+                .anySatisfy(h -> assertThat(h.getCode()).isEqualTo("CANCEL_ORGNO_MISSING"));
+
+        Map<String, Object> order = jdbc.queryForMap("SELECT * FROM orders WHERE id = ?", orderId);
+        assertThat(order.get("status")).isEqualTo("ACKED");   // 비종결 유지 — cancel 시도 자체가 없었음
     }
 
     /**

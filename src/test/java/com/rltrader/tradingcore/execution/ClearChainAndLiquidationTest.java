@@ -79,11 +79,11 @@ class ClearChainAndLiquidationTest extends AbstractIntegrationTest {
         // 보유 10주 clear: attempt1 4주->취소, attempt2 3주->취소, attempt3 3주 전량 -> FILLED
         long d = clearDecisionWithNewOrder(10);
         when(broker.submitMarketOrder("005930", OrderSide.SELL, 10))
-                .thenReturn(new KisOrderAck("0001"));
+                .thenReturn(new KisOrderAck("0001", "05360"));
         when(broker.submitMarketOrder("005930", OrderSide.SELL, 6))
-                .thenReturn(new KisOrderAck("0002"));
+                .thenReturn(new KisOrderAck("0002", "05360"));
         when(broker.submitMarketOrder("005930", OrderSide.SELL, 3))
-                .thenReturn(new KisOrderAck("0003"));
+                .thenReturn(new KisOrderAck("0003", "05360"));
 
         // attempt 1: 4주 체결 후 타임아웃 -> 취소 확정 (잔량 6)
         when(broker.orderSnapshot(eq("0001"), any(LocalDate.class)))
@@ -135,7 +135,7 @@ class ClearChainAndLiquidationTest extends AbstractIntegrationTest {
         // 15:25 bar에서 clear, 잔량 6 남은 채 clock을 15:31로 전진 -> EOD 이월
         long d = clearDecisionWithNewOrder(10);
         when(broker.submitMarketOrder("005930", OrderSide.SELL, 10))
-                .thenReturn(new KisOrderAck("0001"));
+                .thenReturn(new KisOrderAck("0001", "05360"));
         when(broker.orderSnapshot(eq("0001"), any(LocalDate.class)))
                 .thenAnswer(inv -> {
                     mutableClock().advance(Duration.ofSeconds(61));  // 15:36:01 -> 15:31 진입은 아래에서 별도 처리
@@ -218,7 +218,7 @@ class ClearChainAndLiquidationTest extends AbstractIntegrationTest {
         mutableClock().set(Instant.parse("2026-08-08T00:00:00Z")); // 09:00 KST 8/8
 
         when(broker.submitMarketOrder("005930", OrderSide.SELL, 6))
-                .thenReturn(new KisOrderAck("0002"));
+                .thenReturn(new KisOrderAck("0002", "05360"));
         when(broker.orderSnapshot(eq("0002"), any(LocalDate.class)))
                 .thenReturn(Optional.of(new KisOrderSnapshot("0002", 6, 6, new BigDecimal("99.0"), true, false)));
         when(broker.balance()).thenReturn(new KisBalance(0, new BigDecimal("994.00")));
@@ -335,7 +335,7 @@ class ClearChainAndLiquidationTest extends AbstractIntegrationTest {
         // finalization이 이미 커밋돼 있어야 하므로, attempt3의 submitMarketOrder 호출 시점에
         // snapshot.liquidationPending이 여전히 true인지 확인한다.
         when(broker.submitMarketOrder("005930", OrderSide.SELL, 6))
-                .thenReturn(new KisOrderAck("0002"));
+                .thenReturn(new KisOrderAck("0002", "05360"));
         when(broker.orderSnapshot(eq("0002"), any(LocalDate.class)))
                 .thenAnswer(inv -> {
                     mutableClock().advance(Duration.ofSeconds(61));
@@ -353,7 +353,7 @@ class ClearChainAndLiquidationTest extends AbstractIntegrationTest {
                             .isTrue();
                     assertThat(decisions.findById(d).orElseThrow().getExecutionStatus())
                             .isEqualTo("IN_PROGRESS");
-                    return new KisOrderAck("0003");
+                    return new KisOrderAck("0003", "05360");
                 });
         // attempt3: 잔량 4 전량 체결 -> 체인 완료
         when(broker.orderSnapshot(eq("0003"), any(LocalDate.class)))
@@ -390,7 +390,7 @@ class ClearChainAndLiquidationTest extends AbstractIntegrationTest {
         // clock 15:31 -- 단일가 체결 결과 스냅숏 수신 -> FILLED.
         long d = clearDecisionWithNewOrder(10);
         when(broker.submitMarketOrder("005930", OrderSide.SELL, 10))
-                .thenReturn(new KisOrderAck("0001"));
+                .thenReturn(new KisOrderAck("0001", "05360"));
 
         mutableClock().set(Instant.parse("2026-08-07T06:20:00Z")); // 15:20 KST
 
@@ -423,7 +423,7 @@ class ClearChainAndLiquidationTest extends AbstractIntegrationTest {
         // 15:20 bar 주문, 끝까지 미체결인 채 clock 15:36 도달 -> 그때에만 EOD 처리(취소->이월)
         long d = clearDecisionWithNewOrder(10);
         when(broker.submitMarketOrder("005930", OrderSide.SELL, 10))
-                .thenReturn(new KisOrderAck("0001"));
+                .thenReturn(new KisOrderAck("0001", "05360"));
 
         mutableClock().set(Instant.parse("2026-08-07T06:20:00Z")); // 15:20 KST
 

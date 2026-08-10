@@ -251,7 +251,11 @@ public class KisBrokerClient implements BrokerPort {
         String cnclYn = strictText(row.path("cncl_yn"), "cncl_yn");
         boolean cancelled = "Y".equals(cnclYn);
         boolean brokerTerminal = (rmnQty == 0) || cancelled;
-        return new KisOrderSnapshot(odno, orderQty, filledQty, avgPrice, brokerTerminal, cancelled);
+        // 방어적 파싱 — 필드 부재/공백이면 null(ackFrom과 동일 규칙, Fix A 2차 리뷰). 복구·채택
+        // 경로가 제출 ack 없이 이 조회만으로 주문을 알게 될 때 org no의 유일한 출처가 된다.
+        String krxFwdgOrdOrgno = orNullIfBlank(textOrNull(row.path("krx_fwdg_ord_orgno")));
+        return new KisOrderSnapshot(odno, orderQty, filledQty, avgPrice, brokerTerminal, cancelled,
+                krxFwdgOrdOrgno);
     }
 
     /**

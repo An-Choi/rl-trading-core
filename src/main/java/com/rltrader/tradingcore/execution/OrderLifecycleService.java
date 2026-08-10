@@ -269,14 +269,32 @@ public class OrderLifecycleService {
         return next;
     }
 
-    /** 취소 전송 실패(KisTransportException)는 이 태스크에서는 비종결 유지로 전파. */
+    /**
+     * 취소 전송 실패(KisTransportException)는 이 태스크에서는 비종결 유지로 전파.
+     *
+     * <p>Fix A(2차 리뷰) 취소 시점 가드 — 공식 정정취소 계약상 KRX_FWDG_ORD_ORGNO는 필수·비공백
+     * 필드다. org no가 없으면(null/blank) 공백을 전송하지 않는다 — 공백 전송은 KIS 거부로
+     * 이어지고, 그 거부가 반복되며 체인이 비종결로 고착될 수 있다("조용히 공백을 보내고 거부가
+     * 반복되는 것"보다 fail-loud가 낫다). 대신 즉시 HALT + ChainIncompleteException — 주문은
+     * 비종결로 남아 수동 개입(§7) 대상이 된다.
+     */
     private void cancelOrThrow(OrderEntity order) {
+        if (isBlank(order.getKrxFwdgOrdOrgno())) {
+            halts.raise("CANCEL_ORGNO_MISSING", Map.of(
+                    "orderId", order.getId(), "kisOrderNo", order.getKisOrderNo()));
+            throw new ChainIncompleteException(
+                    "krxFwdgOrdOrgno missing for cancel of " + order.getKisOrderNo(), null);
+        }
         try {
             broker.cancelOrder(order.getKisOrderNo(), order.getQty() - order.getFilledQty(),
                     order.getKrxFwdgOrdOrgno());
         } catch (KisTransportException e) {
             throw new ChainIncompleteException("cancel failed for " + order.getKisOrderNo(), e);
         }
+    }
+
+    private static boolean isBlank(String s) {
+        return s == null || s.isBlank();
     }
 
     /**
@@ -388,6 +406,9 @@ public class OrderLifecycleService {
             if (unknown.size() == 1) {
                 KisOrderSnapshot adopted = unknown.get(0);
                 order.setKisOrderNo(adopted.kisOrderNo());
+                // Fix A(2차 리뷰) — 제출 ack 없이 조회로만 알게 된 주문이므로 org no의 유일한
+                // 출처는 이 조회 스냅숏이다. 없으면(null) 그대로 null — 취소 시점의 가드가 처리.
+                order.setKrxFwdgOrdOrgno(adopted.krxFwdgOrdOrgno());
                 order.setSubmittedAt(OffsetDateTime.now(clock));
                 finalization.transition(order, OrderStatus.ACKED,
                         Map.of("kisOrderNo", adopted.kisOrderNo(), "adoptedViaSubmitUnknown", true),
@@ -452,6 +473,7 @@ public class OrderLifecycleService {
             KisOrderSnapshot snap = broker.orderSnapshot(order.getKisOrderNo(), order.getTradingDate())
                     .orElse(null);
             if (snap != null) {
+                backfillOrgNo(order, snap);
                 boolean terminalCandidate = snap.brokerTerminal() || snap.cumulativeFilledQty() >= order.getQty();
                 long updated = Math.max(order.getFilledQty(), snap.cumulativeFilledQty());
                 if (terminalCandidate) {
@@ -472,6 +494,18 @@ public class OrderLifecycleService {
                 return snap;
             }
             sleep(props.fillPollIntervalMs());
+        }
+    }
+
+    /**
+     * Fix A(2차 리뷰) — org no가 아직 없는(예: SUBMIT_UNKNOWN 채택 시점에 스냅숏에도 없었던)
+     * 주문을 이후 폴링에서 org no가 채워진 스냅숏으로 관찰하면 엔티티에 반영한다. 여기서는 저장을
+     * 직접 하지 않는다 — 같은 반복에서 곧바로 이어지는 progressFilledQty/transition(둘 다
+     * orders.save 포함)의 기존 커밋에 얹혀간다(새 tx 없음, 브리프 지시).
+     */
+    private void backfillOrgNo(OrderEntity order, KisOrderSnapshot snap) {
+        if (order.getKrxFwdgOrdOrgno() == null && snap.krxFwdgOrdOrgno() != null) {
+            order.setKrxFwdgOrdOrgno(snap.krxFwdgOrdOrgno());
         }
     }
 

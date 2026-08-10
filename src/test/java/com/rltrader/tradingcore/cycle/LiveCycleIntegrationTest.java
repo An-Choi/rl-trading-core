@@ -183,7 +183,7 @@ class LiveCycleIntegrationTest extends AbstractIntegrationTest {
                 .thenAnswer(inv -> {
                     enteredBroker.countDown();
                     releaseBroker.await();
-                    return new KisOrderAck("0001");
+                    return new KisOrderAck("0001", "05360");
                 });
         when(broker.orderSnapshot(eq("0001"), any(LocalDate.class)))
                 .thenReturn(Optional.of(new KisOrderSnapshot(
@@ -239,7 +239,7 @@ class LiveCycleIntegrationTest extends AbstractIntegrationTest {
                 okBody(1, "add_unit", "2026-08-07T11:00:00+09:00"))));
 
         when(broker.submitMarketOrder(eq("005930"), eq(OrderSide.BUY), anyLong()))
-                .thenReturn(new KisOrderAck("0001"));
+                .thenReturn(new KisOrderAck("0001", "05360"));
         // 폴링: terminal 후보(전량 체결) 반환, 그 다음 확정 조회(confirm)가 전송 계층 실패
         when(broker.orderSnapshot(eq("0001"), any(LocalDate.class)))
                 .thenReturn(Optional.of(new KisOrderSnapshot(
@@ -304,7 +304,7 @@ class LiveCycleIntegrationTest extends AbstractIntegrationTest {
         portfolio.apply(new PortfolioState(1, 6.0, 400.00, BAR.minusMinutes(30)));
 
         when(broker.submitMarketOrder(eq("005930"), eq(OrderSide.SELL), anyLong()))
-                .thenReturn(new KisOrderAck("0002"));
+                .thenReturn(new KisOrderAck("0002", "05360"));
         when(broker.orderSnapshot(eq("0002"), any(LocalDate.class)))
                 .thenReturn(Optional.of(new KisOrderSnapshot(
                         "0002", 6, 6, new BigDecimal("99.0"), true, false)));
@@ -329,9 +329,9 @@ class LiveCycleIntegrationTest extends AbstractIntegrationTest {
                 okBody(1, "add_unit", "2026-08-07T11:00:00+09:00"))));   // qty=floor(1990/100)=19
 
         when(broker.submitMarketOrder(eq("005930"), eq(OrderSide.BUY), eq(19L)))
-                .thenReturn(new KisOrderAck("T001"));
+                .thenReturn(new KisOrderAck("T001", "05360"));
         when(broker.submitMarketOrder(eq("005930"), eq(OrderSide.BUY), eq(16L)))
-                .thenReturn(new KisOrderAck("T002"));
+                .thenReturn(new KisOrderAck("T002", "05360"));
         // attempt1: 폴링 1회차 부분(3주) → clock 61s 전진 → 데드라인 도달 → 취소 흐름
         when(broker.orderSnapshot(eq("T001"), any(LocalDate.class)))
                 .thenAnswer(inv -> {

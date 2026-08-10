@@ -169,6 +169,14 @@ public class ReconciliationService {
             if (snap == null) {
                 continue;
             }
+            // Fix A(2차 리뷰) — org no가 아직 없는(복구·채택된) 주문을 이 조회로 관찰하면 엔티티에
+            // 반영한다. 저장은 여기서 직접 하지 않는다 — 아래 세 분기(finalizeObservedFill/
+            // finalizeObservedTerminalRemainder/requestCancel의 취소 가드)가 곧바로 이어지며,
+            // 앞의 둘은 finalizeChain의 기존 orders.save에 얹혀가고, requestCancel은 이 값을 바로
+            // 사용한다(새 tx 없음, 브리프 지시).
+            if (order.getKrxFwdgOrdOrgno() == null && snap.krxFwdgOrdOrgno() != null) {
+                order.setKrxFwdgOrdOrgno(snap.krxFwdgOrdOrgno());
+            }
             // 리뷰 수정(Important) — FILLED는 filled_qty == qty일 때만이다(ck_orders_filled_terminal
             // CHECK가 이를 강제). 이전엔 brokerTerminal && !cancelled만으로 FILLED 판정해, IOC/FOK 등
             // 브로커가 "더 이상 진행 안 함"을 잔량 미체결인 채 종결로 보고하는 경우 DB CHECK 위반으로
@@ -207,7 +215,20 @@ public class ReconciliationService {
         }
     }
 
+    /**
+     * Fix A(2차 리뷰) 취소 시점 가드 — OrderLifecycleService.cancelOrThrow와 동일 규칙: 공식
+     * 정정취소 계약상 KRX_FWDG_ORD_ORGNO는 필수·비공백이므로 없으면 공백을 전송하지 않는다.
+     * 대사 경로는 폴링 루프가 아니라 주기 회차이므로 예외를 던지지 않고(그러면 이 회차의 나머지
+     * 주문 처리가 막힌다) HALT만 발생시키고 다음 회차로 넘어간다 — 주문은 비종결로 남는다.
+     */
     private void requestCancel(OrderEntity order) {
+        if (order.getKrxFwdgOrdOrgno() == null || order.getKrxFwdgOrdOrgno().isBlank()) {
+            halts.raise("CANCEL_ORGNO_MISSING", Map.of(
+                    "orderId", order.getId(), "kisOrderNo", order.getKisOrderNo()));
+            log.error("[RECON] cancel skipped for order {} — krxFwdgOrdOrgno missing (HALT raised)",
+                    order.getId());
+            return;
+        }
         try {
             broker.cancelOrder(order.getKisOrderNo(), order.getQty() - order.getFilledQty(),
                     order.getKrxFwdgOrdOrgno());
@@ -242,6 +263,9 @@ public class ReconciliationService {
             if (unknown.size() == 1) {
                 KisOrderSnapshot adopted = unknown.get(0);
                 order.setKisOrderNo(adopted.kisOrderNo());
+                // Fix A(2차 리뷰) — 제출 ack 없이 부팅 시점 조회로만 알게 된 주문이므로 org no의
+                // 유일한 출처는 이 스냅숏이다.
+                order.setKrxFwdgOrdOrgno(adopted.krxFwdgOrdOrgno());
                 order.setSubmittedAt(OffsetDateTime.now(clock));
                 finalization.transition(order, OrderStatus.ACKED,
                         Map.of("kisOrderNo", adopted.kisOrderNo(), "adoptedAtBoot", true),
