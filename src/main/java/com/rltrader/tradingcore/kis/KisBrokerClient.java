@@ -30,10 +30,12 @@ import tools.jackson.databind.json.JsonMapper;
 @Component
 public class KisBrokerClient implements BrokerPort {
 
-    /** 모의투자 TR ID 초안 — KIS 문서 재확인 필요. */
+    /** 모의투자 TR ID 초안 — KIS 문서 재확인 필요 — 스모크 실검증. */
     private static final class TrId {
-        static final String BUY = "VTTC0802U";
-        static final String SELL = "VTTC0801U";
+        // 현금주문(order-cash) 공식 샘플 기준 — 모의투자 VTTC0012U(매수)/VTTC0011U(매도)
+        // (실전 TTTC0012U/TTTC0011U). Fix B(2차 리뷰) — 이전 VTTC0802U/VTTC0801U는 구세대 TR ID였다.
+        static final String BUY = "VTTC0012U";
+        static final String SELL = "VTTC0011U";
         // 정정취소(order-rvsecncl) 공식 샘플 기준 — 모의투자 VTTC0013U(실전 TTTC0013U). KIS 문서
         // 재확인 필요(Fix 1 — 이전 VTTC0803U는 정정취소 엔드포인트의 공식 TR ID가 아니었다).
         static final String CANCEL = "VTTC0013U";
@@ -99,6 +101,7 @@ public class KisBrokerClient implements BrokerPort {
         body.put("ORD_DVSN", "01"); // 01 = 시장가
         body.put("ORD_QTY", String.valueOf(qty));
         body.put("ORD_UNPR", "0");
+        body.put("EXCG_ID_DVSN_CD", "KRX"); // 공식 현금주문 샘플 필수 필드(Fix B, 2차 리뷰)
         return body;
     }
 

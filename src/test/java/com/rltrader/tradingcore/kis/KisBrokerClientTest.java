@@ -35,14 +35,26 @@ class KisBrokerClientTest {
     @Test
     void submit_buy_returns_ack() {
         wm.stubFor(post(urlEqualTo("/uapi/domestic-stock/v1/trading/order-cash"))
-                .withHeader("tr_id", equalTo("VTTC0802U"))
+                .withHeader("tr_id", equalTo("VTTC0012U"))
                 .willReturn(okJson("""
                     {"rt_cd":"0","output":{"ODNO":"0000012345","KRX_FWDG_ORD_ORGNO":"05360"}}""")));
         KisOrderAck ack = client.submitMarketOrder("005930", OrderSide.BUY, 10);
         assertThat(ack.kisOrderNo()).isEqualTo("0000012345");
         assertThat(ack.krxFwdgOrdOrgno()).isEqualTo("05360");
         wm.verify(postRequestedFor(urlEqualTo("/uapi/domestic-stock/v1/trading/order-cash"))
-                .withRequestBody(matchingJsonPath("$.ORD_DVSN", equalTo("01"))));  // 시장가
+                .withRequestBody(matchingJsonPath("$.ORD_DVSN", equalTo("01")))  // 시장가
+                .withRequestBody(matchingJsonPath("$.EXCG_ID_DVSN_CD", equalTo("KRX"))));  // Fix B
+    }
+
+    // Fix B(2차 리뷰) — 매도도 공식 샘플의 전용 TR ID(VTTC0011U)를 쓴다(매수 VTTC0012U와 별개).
+    @Test
+    void submit_sell_uses_sell_tr_id() {
+        wm.stubFor(post(urlEqualTo("/uapi/domestic-stock/v1/trading/order-cash"))
+                .withHeader("tr_id", equalTo("VTTC0011U"))
+                .willReturn(okJson("""
+                    {"rt_cd":"0","output":{"ODNO":"0000054321","KRX_FWDG_ORD_ORGNO":"05360"}}""")));
+        KisOrderAck ack = client.submitMarketOrder("005930", OrderSide.SELL, 10);
+        assertThat(ack.kisOrderNo()).isEqualTo("0000054321");
     }
 
     // Fix 1 — 원주문 ack에 KRX_FWDG_ORD_ORGNO가 없거나 공백이면 방어적으로 null(부재는
@@ -50,7 +62,7 @@ class KisBrokerClientTest {
     @Test
     void submit_buy_without_org_no_in_ack_parses_as_null() {
         wm.stubFor(post(urlEqualTo("/uapi/domestic-stock/v1/trading/order-cash"))
-                .withHeader("tr_id", equalTo("VTTC0802U"))
+                .withHeader("tr_id", equalTo("VTTC0012U"))
                 .willReturn(okJson("{\"rt_cd\":\"0\",\"output\":{\"ODNO\":\"0000012345\"}}")));
         KisOrderAck ack = client.submitMarketOrder("005930", OrderSide.BUY, 10);
         assertThat(ack.kisOrderNo()).isEqualTo("0000012345");
