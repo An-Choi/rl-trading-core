@@ -110,11 +110,16 @@ class ReconciliationServiceTest extends AbstractIntegrationTest {
     /** CANCELLED 주문 — accounted qty/notional 지정, filled_qty=accounted(부분 체결로 종결). */
     private long insertCancelledOrder(long decisionId, String kisOrderNo, long qty,
             long accountedQty, BigDecimal accountedNotional) {
+        return insertCancelledOrder(decisionId, kisOrderNo, qty, accountedQty, accountedNotional, "BUY");
+    }
+
+    private long insertCancelledOrder(long decisionId, String kisOrderNo, long qty,
+            long accountedQty, BigDecimal accountedNotional, String side) {
         return jdbc.queryForObject("""
             INSERT INTO orders (decision_id, attempt, trading_date, symbol, side, qty, order_type,
                 status, kis_order_no, filled_qty, accounted_filled_qty, accounted_fill_notional, terminal_at)
-            VALUES (?, 1, CURRENT_DATE, ?, 'BUY', ?, 'MARKET', 'CANCELLED', ?, ?, ?, ?, now())
-            RETURNING id""", Long.class, decisionId, SYMBOL, qty, kisOrderNo, accountedQty,
+            VALUES (?, 1, CURRENT_DATE, ?, ?, ?, 'MARKET', 'CANCELLED', ?, ?, ?, ?, now())
+            RETURNING id""", Long.class, decisionId, SYMBOL, side, qty, kisOrderNo, accountedQty,
                 accountedQty, accountedNotional);
     }
 
@@ -136,6 +141,12 @@ class ReconciliationServiceTest extends AbstractIntegrationTest {
      * 증명한다(round 3 리뷰 수정 covering test).
      */
     private void seedSnapshot(int units, double shares, double cash, ZonedDateTime entryBarTs) {
+        seedSnapshot(units, shares, cash, entryBarTs, false);
+    }
+
+    /** Fix 2 covering tests — 이월(liquidation_pending=true) 스냅숏을 직접 구성. */
+    private void seedSnapshot(int units, double shares, double cash, ZonedDateTime entryBarTs,
+            boolean liquidationPending) {
         PortfolioSnapshotEntity s = new PortfolioSnapshotEntity();
         s.setSymbol(SYMBOL);
         s.setUnits(units);
@@ -144,7 +155,7 @@ class ReconciliationServiceTest extends AbstractIntegrationTest {
         s.setArtifactId(CTX.artifactId());
         s.setEntryBarTs(entryBarTs != null ? entryBarTs.toOffsetDateTime() : null);
         s.setUpdatedAt(OffsetDateTime.now());
-        s.setLiquidationPending(false);
+        s.setLiquidationPending(liquidationPending);
         snapshots.save(s);
         portfolio.apply(new PortfolioState(units, shares, cash, entryBarTs));
     }
@@ -448,6 +459,78 @@ class ReconciliationServiceTest extends AbstractIntegrationTest {
         Long execCount = jdbc.queryForObject(
                 "SELECT COUNT(*) FROM executions WHERE order_id = ?", Long.class, orderId);
         assertThat(execCount).isEqualTo(1L);   // 최초 finalize 때 생긴 1건 그대로, adjustment는 추가 안 함
+    }
+
+    /**
+     * Fix 2 (P1) — SELL 이월 중(liquidationPending=true) 지연 체결이 잔량 전체를 채우면(canonical
+     * == qty) correctCancelledToFilled뿐 아니라 같은 tx에서 체인 완결까지 커밋해야 한다: snapshot
+     * units=0/entryBarTs=null/liquidationPending=false + decision COMPLETED. 커밋 후 메모리도
+     * snapshot과 일치해야 한다(spec §2).
+     */
+    @Test
+    void late_fill_completes_carried_liquidation_chain_in_same_tx() {
+        long d = insertDecision();
+        jdbc.update("UPDATE decisions SET execution_status = 'IN_PROGRESS' WHERE id = ?", d);
+        ZonedDateTime staleEntry = ZonedDateTime.parse("2026-08-01T02:00:00Z");
+        long orderId = insertCancelledOrder(d, "K010", 10, 6, new BigDecimal("600.0000"), "SELL");
+        insertExecution(d, orderId, 100.0, -6.0, 1, 6.0, 9600.0);
+        seedSnapshot(1, 6.0, 9600.0, staleEntry, true);   // liquidation_pending=true — carried
+
+        // KIS 누적 체결이 10(=qty) 도달 — 정정 후 FILLED이면서 잔량 0 도달(체인 완결 트리거)
+        when(broker.orderSnapshot(eq("K010"), any(LocalDate.class)))
+                .thenReturn(Optional.of(new KisOrderSnapshot("K010", 10, 10, new BigDecimal("100.0"), true, true)));
+        when(broker.balance()).thenReturn(new KisBalance(0, new BigDecimal("10000.00")));
+
+        recon.reconcile(Trigger.PERIODIC);
+
+        Map<String, Object> order = jdbc.queryForMap("SELECT * FROM orders WHERE id = ?", orderId);
+        assertThat(order.get("status")).isEqualTo("FILLED");
+        assertThat(((Number) order.get("accounted_filled_qty")).longValue()).isEqualTo(10L);
+
+        PortfolioSnapshotEntity snap = snapshots.findById(SYMBOL).orElseThrow();
+        assertThat(snap.isLiquidationPending()).isFalse();
+        assertThat(snap.getUnits()).isEqualTo(0);
+        assertThat(snap.getEntryBarTs()).isNull();
+
+        Map<String, Object> decision = jdbc.queryForMap(
+                "SELECT execution_status FROM decisions WHERE id = ?", d);
+        assertThat(decision.get("execution_status")).isEqualTo("COMPLETED");
+
+        // 커밋 후 메모리 == snapshot (spec §2)
+        assertThat(portfolio.current().units()).isEqualTo(0);
+        assertThat(portfolio.current().entryBarTs()).isNull();
+        assertThat(portfolio.current().shares()).isEqualTo(snap.getShares().doubleValue());
+    }
+
+    /**
+     * Fix 2 BUY 대응 사례 — zero-fill로 give-up(units=0, decisionTotal=0)한 BUY가 뒤늦게 전량
+     * 체결로 정정되면(decisionTotal 0→10) "units=0인데 shares>0" 조합을 남기지 않고 같은 tx에서
+     * units를 1로 보정 + PARTIAL_UNIT 알림을 남긴다.
+     */
+    @Test
+    void late_fill_on_zero_fill_buy_corrects_units_with_partial_unit_alert() {
+        long d = insertDecision();
+        jdbc.update("UPDATE decisions SET execution_status = 'IN_PROGRESS' WHERE id = ?", d);
+        long orderId = insertCancelledOrder(d, "K011", 10, 0, BigDecimal.ZERO.setScale(4), "BUY");
+        seedSnapshot(0, 0.0, 10_000.0);
+
+        when(broker.orderSnapshot(eq("K011"), any(LocalDate.class)))
+                .thenReturn(Optional.of(new KisOrderSnapshot("K011", 10, 10, new BigDecimal("100.0"), true, true)));
+        when(broker.balance()).thenReturn(new KisBalance(10, new BigDecimal("9000.00")));
+
+        recon.reconcile(Trigger.PERIODIC);
+
+        Map<String, Object> order = jdbc.queryForMap("SELECT * FROM orders WHERE id = ?", orderId);
+        assertThat(order.get("status")).isEqualTo("FILLED");
+        assertThat(((Number) order.get("accounted_filled_qty")).longValue()).isEqualTo(10L);
+
+        PortfolioSnapshotEntity snap = snapshots.findById(SYMBOL).orElseThrow();
+        assertThat(snap.getUnits()).isEqualTo(1);
+        assertThat(snap.getEntryBarTs()).isNotNull();
+        assertThat(portfolio.current().units()).isEqualTo(1);
+        assertThat(portfolio.current().shares()).isEqualTo(10.0);
+
+        assertThat(alertRepo.findAll()).anySatisfy(a -> assertThat(a.getCode()).isEqualTo("PARTIAL_UNIT"));
     }
 
     // ---------------------------------------------------------------- 시나리오 3

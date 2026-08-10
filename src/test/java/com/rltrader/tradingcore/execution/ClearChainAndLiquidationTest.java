@@ -244,6 +244,58 @@ class ClearChainAndLiquidationTest extends AbstractIntegrationTest {
     }
 
     /**
+     * Fix 2 방어 가드 — snapshot.shares(잔량 투영)가 이미 0인데 liquidationPending 플래그만
+     * stale하게 true로 남아있는 경우(예: 대사의 지연 체결 정정이 잔량을 이미 채웠지만 다른 경로로
+     * 플래그가 아직 꺼지지 않은 상태를 재현). resume()은 신규 attempt를 제출하지 않고(브로커
+     * 호출 없음) 체인을 완결해야 한다 — units=0, entryBarTs=null, liquidationPending=false,
+     * decision COMPLETED.
+     */
+    @Test
+    void resume_with_zero_remaining_completes_chain_without_resubmission() {
+        long d = clearDecisionWithNewOrder(10);
+        OrderEntity attempt1 = orders.findByDecisionIdAndStatus(d, OrderStatus.NEW).orElseThrow();
+        attempt1.setKisOrderNo("0001");
+        attempt1.setStatus(OrderStatus.CANCELLED);
+        attempt1.setFilledQty(10);
+        attempt1.setAccountedFilledQty(10);
+        attempt1.setAvgFillPrice(new BigDecimal("100.0"));
+        attempt1.setAccountedFillNotional(new BigDecimal("1000.0"));
+        orders.save(attempt1);
+
+        PortfolioSnapshotEntity snap = new PortfolioSnapshotEntity();
+        snap.setSymbol("005930");
+        snap.setUnits(1);
+        snap.setShares(0.0);   // 잔량 0 — flag만 stale하게 true
+        snap.setCash(0.0);
+        snap.setEntryBarTs(TestFixtures.bar("2026-08-07T09:10").toOffsetDateTime());
+        snap.setArtifactId(TestFixtures.ctx().artifactId());
+        snap.setUpdatedAt(java.time.OffsetDateTime.now());
+        snap.setLiquidationPending(true);
+        snapshots.save(snap);
+        portfolioManager.apply(new PortfolioState(1, 0.0, 0.0, TestFixtures.bar("2026-08-07T09:10")));
+
+        mutableClock().set(Instant.parse("2026-08-08T00:00:00Z")); // 익일 09:00 KST
+
+        assertThat(liquidation.pendingActive()).isTrue();
+
+        ChainOutcome out = liquidation.resume(TestFixtures.bar("2026-08-08T09:00"));
+
+        verifyNoInteractions(broker);
+        assertThat(out.after().units()).isEqualTo(0);
+        assertThat(out.after().entryBarTs()).isNull();
+
+        var snapAfter = snapshots.findById("005930").orElseThrow();
+        assertThat(snapAfter.isLiquidationPending()).isFalse();
+        assertThat(snapAfter.getUnits()).isEqualTo(0);
+        assertThat(snapAfter.getEntryBarTs()).isNull();
+        assertThat(decisions.findById(d).orElseThrow().getExecutionStatus()).isEqualTo("COMPLETED");
+        assertThat(liquidation.pendingActive()).isFalse();
+
+        // 신규 attempt(attempt2)가 생성되지 않았어야 한다 — 재제출 없음
+        assertThat(orders.findAll().stream().filter(o -> o.getDecisionId() == d).count()).isEqualTo(1);
+    }
+
+    /**
      * 리뷰 수정(Critical) 커버 테스트 — 재개된 이월 체인의 첫 재개 attempt 자체가 부분체결 후
      * 타임아웃->취소->재시도(잔량 있음, 아직 EOD 아님)로 이어질 때, 그 중간 finalization이
      * liquidationPending을 하드코딩된 false로 조용히 꺼버리지 않고 true로 재확언해야 한다 —

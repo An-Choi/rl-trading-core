@@ -450,14 +450,29 @@ public class ReconciliationService {
      * lock 하 재확인 + adjustment INSERT + orders.accounted 갱신 + snapshot delta + (정정 후
      * filled==qty면) correctCancelledToFilled — 전부 한 tx. 커밋 성공 직후 메모리 갱신
      * (portfolio.apply)까지 이 메서드가 책임진다(spec §2 "커밋 후 메모리" 규칙, finalization과 동일 패턴).
+     *
+     * <p>Fix 2 — chain-completion semantics (스펙 §4: clear 체인은 잔량0·이월·HALT 외로 끝나지
+     * 않는다 — 전량 도달 = 잔량 0 종료). correctCancelledToFilled는 order 상태만 고치던 이전
+     * 구현은 여기서 끝났지만, 그 order가 SELL이고 이월 중(snapshot.liquidationPending=true)이면
+     * 이 지연 체결이 사실은 clear 체인의 완결이다 — 상태만 고치고 units/entryBarTs/liquidationPending/
+     * decision을 그대로 두면 잔량 0인데 이월 플래그가 영구히 켜진 채로 남는다(스펙 위반, 클린업
+     * 경로 없음). 같은 tx에서 units=0·entryBarTs=null·liquidationPending=false·decision COMPLETED까지
+     * 커밋한다.
+     *
+     * <p>BUY 대응 사례 — zero-fill로 give-up한(units 그대로, decisionTotal 0) BUY가 뒤늦게 이
+     * 정정으로 decisionTotal 0→양수가 되면 "units=0인데 shares>0"이라는 계약에 없는 조합이
+     * 생긴다(OrderLifecycleService.applyFill의 chain-end 규칙상 이 조합은 정상 경로에서 나올 수
+     * 없다). 같은 tx에서 units를 보정(+1, 최초 진입이면 entryBarTs도 decision bar로 세팅)하고
+     * PARTIAL_UNIT 알림을 남긴다.
      */
     private boolean applyAdjustmentTx(long orderId, long canonicalQty, BigDecimal toNotional) {
-        record Result(boolean applied, PortfolioState after) {}
+        record Result(boolean applied, PortfolioState after, boolean sellChainCompleted,
+                       boolean buyUnitCorrected, long decisionId) {}
         Result result = tx.execute(status -> {
             OrderEntity locked = orders.findByIdForUpdate(orderId).orElseThrow();
             long delta = canonicalQty - locked.getAccountedFilledQty();
             if (delta <= 0) {
-                return new Result(false, null);   // 동시 대사 회차가 이미 반영 — 멱등
+                return new Result(false, null, false, false, 0);   // 동시 대사 회차가 이미 반영 — 멱등
             }
             BigDecimal fromNotional = locked.getAccountedFillNotional();
             BigDecimal notionalDelta = toNotional.subtract(fromNotional).setScale(SCALE, RoundingMode.HALF_UP);
@@ -473,6 +488,9 @@ public class ReconciliationService {
             adj.setReason("RECONCILE_LATE_FILL");
             adjustments.save(adj);
 
+            long decisionTotalQtyBefore = orders.sumAccountedFilledQtyByDecisionId(locked.getDecisionId());
+            long decisionTotalQtyAfter = decisionTotalQtyBefore - locked.getAccountedFilledQty() + canonicalQty;
+
             locked.setAccountedFilledQty(canonicalQty);
             locked.setAccountedFillNotional(toNotional);
             locked.setFilledQty(Math.max(locked.getFilledQty(), canonicalQty));
@@ -480,21 +498,54 @@ public class ReconciliationService {
 
             PortfolioState before = portfolio.current();
             double signedDelta = locked.getSide() == OrderSide.SELL ? -delta : delta;
-            PortfolioState after = new PortfolioState(before.units(), before.shares() + signedDelta,
-                    before.cash(), before.entryBarTs());
+            double newShares = before.shares() + signedDelta;
 
+            boolean reachedFull = canonicalQty == locked.getQty();
             PortfolioSnapshotEntity snapshotEntity = snapshots.findById(locked.getSymbol()).orElseThrow();
+            boolean sellChainCompletes = reachedFull && locked.getSide() == OrderSide.SELL
+                    && snapshotEntity.isLiquidationPending();
+            boolean buyUnitNeedsCorrection = reachedFull && locked.getSide() == OrderSide.BUY
+                    && before.units() == 0 && decisionTotalQtyBefore <= 0 && decisionTotalQtyAfter > 0;
+
+            PortfolioState after;
+            if (sellChainCompletes) {
+                after = new PortfolioState(0, newShares, before.cash(), null);
+            } else if (buyUnitNeedsCorrection) {
+                ZonedDateTime entry = decisionBarTs(locked.getDecisionId());
+                after = new PortfolioState(1, newShares, before.cash(), entry);
+            } else {
+                after = new PortfolioState(before.units(), newShares, before.cash(), before.entryBarTs());
+            }
+
             snapshotEntity.setShares(after.shares());
             snapshotEntity.setUpdatedAt(OffsetDateTime.now(clock));
+            if (sellChainCompletes) {
+                snapshotEntity.setUnits(0);
+                snapshotEntity.setEntryBarTs(null);
+                snapshotEntity.setLiquidationPending(false);
+            } else if (buyUnitNeedsCorrection) {
+                snapshotEntity.setUnits(1);
+                snapshotEntity.setEntryBarTs(after.entryBarTs().toOffsetDateTime());
+            }
             snapshots.save(snapshotEntity);
 
-            if (canonicalQty == locked.getQty()) {
+            if (reachedFull) {
                 correctCancelledToFilled(locked);
             }
-            return new Result(true, after);
+            if (sellChainCompletes) {
+                var d = decisions.findById(locked.getDecisionId()).orElseThrow();
+                d.setExecutionStatus("COMPLETED");
+                decisions.save(d);
+            }
+            return new Result(true, after, sellChainCompletes, buyUnitNeedsCorrection, locked.getDecisionId());
         });
         if (result.applied()) {
             portfolio.apply(result.after());   // 커밋 성공 직후에만 메모리 반영 (spec §2)
+            if (result.buyUnitCorrected()) {
+                ZonedDateTime barTs = decisionBarTs(result.decisionId());
+                alerts.record("PARTIAL_UNIT", barTs, Map.of(
+                        "decisionId", result.decisionId(), "source", "RECONCILE_LATE_FILL_UNIT_CORRECTION"));
+            }
         }
         return result.applied();
     }
