@@ -10,6 +10,8 @@ import com.rltrader.tradingcore.ledger.PortfolioSnapshotRepository;
 import com.rltrader.tradingcore.portfolio.PortfolioManager;
 import com.rltrader.tradingcore.predict.ArtifactContext;
 import java.math.BigDecimal;
+import java.time.Clock;
+import java.time.OffsetDateTime;
 import java.time.ZonedDateTime;
 import java.util.List;
 import java.util.Optional;
@@ -42,16 +44,18 @@ public class LiquidationService {
     private final OrderLifecycleService lifecycle;
     private final PortfolioManager portfolio;
     private final TransactionTemplate tx;
+    private final Clock clock;
 
     public LiquidationService(PortfolioSnapshotRepository snapshots, DecisionRepository decisions,
             OrderRepository orders, OrderLifecycleService lifecycle, PortfolioManager portfolio,
-            TransactionTemplate tx) {
+            TransactionTemplate tx, Clock clock) {
         this.snapshots = snapshots;
         this.decisions = decisions;
         this.orders = orders;
         this.lifecycle = lifecycle;
         this.portfolio = portfolio;
         this.tx = tx;
+        this.clock = clock;
     }
 
     /** 이월 대기 중인 clear 체인이 있는지 — snapshot.liquidationPending 조회. */
@@ -121,7 +125,7 @@ public class LiquidationService {
             locked.setUnits(0);
             locked.setEntryBarTs(null);
             locked.setLiquidationPending(false);
-            locked.setUpdatedAt(java.time.OffsetDateTime.now());
+            locked.setUpdatedAt(OffsetDateTime.now(clock));
             snapshots.save(locked);
 
             DecisionEntity lockedDecision = decisions.findById(decision.getId()).orElseThrow();
