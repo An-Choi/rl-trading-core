@@ -249,7 +249,8 @@ public class OrderLifecycleService {
     /** 취소 전송 실패(KisTransportException)는 이 태스크에서는 비종결 유지로 전파. */
     private void cancelOrThrow(OrderEntity order) {
         try {
-            broker.cancelOrder(order.getKisOrderNo(), order.getQty() - order.getFilledQty());
+            broker.cancelOrder(order.getKisOrderNo(), order.getQty() - order.getFilledQty(),
+                    order.getKrxFwdgOrdOrgno());
         } catch (KisTransportException e) {
             throw new ChainIncompleteException("cancel failed for " + order.getKisOrderNo(), e);
         }
@@ -274,6 +275,7 @@ public class OrderLifecycleService {
                 KisOrderAck ack = broker.submitMarketOrder(order.getSymbol(), order.getSide(), order.getQty());
                 finalization.transition(order, OrderStatus.SUBMITTED, Map.of());
                 order.setKisOrderNo(ack.kisOrderNo());
+                order.setKrxFwdgOrdOrgno(ack.krxFwdgOrdOrgno());
                 order.setSubmittedAt(OffsetDateTime.now(clock));
                 finalization.transition(order, OrderStatus.ACKED, Map.of("kisOrderNo", ack.kisOrderNo()));
                 return SubmitOutcome.of(order);

@@ -14,7 +14,11 @@ public interface BrokerPort {
      */
     KisOrderAck submitMarketOrder(String symbol, OrderSide side, long qty);
 
-    void cancelOrder(String kisOrderNo, long remainingQty);
+    /**
+     * krxFwdgOrdOrgno는 원주문 제출 ack가 반환한 값(없으면 null) — 부재 시 빈 문자열로 전송한다
+     * (KisBrokerClient, Fix 1: 공식 정정취소 샘플 정합).
+     */
+    void cancelOrder(String kisOrderNo, long remainingQty, String krxFwdgOrdOrgno);
 
     /** 당일 주문 전체 — pagination(tr_cont) 완주. 조회는 재시도 안전. */
     List<KisOrderSnapshot> dailyOrders(LocalDate tradingDate);

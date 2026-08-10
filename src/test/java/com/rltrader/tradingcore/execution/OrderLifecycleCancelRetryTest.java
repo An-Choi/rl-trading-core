@@ -217,7 +217,7 @@ class OrderLifecycleCancelRetryTest extends AbstractIntegrationTest {
         // 취소는 실제로 전송됐다(레이스) — 그러나 확정 조회가 전량 체결을 반환해 체결이 이긴다.
         // "취소 실패는 order_events detail로만" — 종결 전이는 FILLED 하나만 기록되고 CANCELLED는
         // 커밋되지 않는다.
-        verify(broker, times(1)).cancelOrder(anyString(), anyLong());
+        verify(broker, times(1)).cancelOrder(anyString(), anyLong(), any());
 
         var events = TestFixtures.eventsFor(orderEvents, order);
         assertThat(events).extracting("toStatus").containsSubsequence("CANCEL_PENDING", "FILLED");

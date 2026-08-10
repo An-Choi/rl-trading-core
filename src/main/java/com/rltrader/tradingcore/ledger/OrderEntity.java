@@ -51,6 +51,9 @@ public class OrderEntity {
     @Column(name = "kis_order_no", length = 16)
     private String kisOrderNo;
 
+    @Column(name = "krx_fwdg_ord_orgno", length = 16)
+    private String krxFwdgOrdOrgno;
+
     @Column(name = "filled_qty", nullable = false)
     private long filledQty;
 
@@ -150,6 +153,14 @@ public class OrderEntity {
 
     public void setKisOrderNo(String kisOrderNo) {
         this.kisOrderNo = kisOrderNo;
+    }
+
+    public String getKrxFwdgOrdOrgno() {
+        return krxFwdgOrdOrgno;
+    }
+
+    public void setKrxFwdgOrdOrgno(String krxFwdgOrdOrgno) {
+        this.krxFwdgOrdOrgno = krxFwdgOrdOrgno;
     }
 
     public long getFilledQty() {

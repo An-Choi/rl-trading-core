@@ -209,7 +209,8 @@ public class ReconciliationService {
 
     private void requestCancel(OrderEntity order) {
         try {
-            broker.cancelOrder(order.getKisOrderNo(), order.getQty() - order.getFilledQty());
+            broker.cancelOrder(order.getKisOrderNo(), order.getQty() - order.getFilledQty(),
+                    order.getKrxFwdgOrdOrgno());
         } catch (KisTransportException e) {
             log.warn("[RECON] cancel request failed for order {} — retry next pass", order.getId(), e);
         }

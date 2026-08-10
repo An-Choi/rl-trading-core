@@ -34,7 +34,9 @@ public class KisBrokerClient implements BrokerPort {
     private static final class TrId {
         static final String BUY = "VTTC0802U";
         static final String SELL = "VTTC0801U";
-        static final String CANCEL = "VTTC0803U";
+        // 정정취소(order-rvsecncl) 공식 샘플 기준 — 모의투자 VTTC0013U(실전 TTTC0013U). KIS 문서
+        // 재확인 필요(Fix 1 — 이전 VTTC0803U는 정정취소 엔드포인트의 공식 TR ID가 아니었다).
+        static final String CANCEL = "VTTC0013U";
         static final String DAILY_CCLD = "VTTC8001R";
         static final String BALANCE = "VTTC8434R";
     }
@@ -73,14 +75,16 @@ public class KisBrokerClient implements BrokerPort {
     }
 
     @Override
-    public void cancelOrder(String kisOrderNo, long remainingQty) {
+    public void cancelOrder(String kisOrderNo, long remainingQty, String krxFwdgOrdOrgno) {
         Map<String, Object> body = new LinkedHashMap<>();
         body.put("CANO", props.accountNo());
         body.put("ACNT_PRDT_CD", props.accountProductCode());
-        body.put("KRX_FWDG_ORD_ORGNO", "");
+        // 원주문 제출 ack가 반환한 값을 그대로 전달 — 부재(null/공백)면 공식 샘플대로 공백 전송.
+        body.put("KRX_FWDG_ORD_ORGNO", krxFwdgOrdOrgno == null ? "" : krxFwdgOrdOrgno);
         body.put("ORGN_ODNO", kisOrderNo);
         body.put("ORD_DVSN", "00"); // 취소는 가격 구분 무의미 — 플레이스홀더(재확인 필요)
         body.put("RVSE_CNCL_DVSN_CD", "02"); // 02 = 취소
+        body.put("EXCG_ID_DVSN_CD", "KRX"); // 공식 정정취소 샘플 필수 필드(Fix 1)
         body.put("ORD_QTY", String.valueOf(remainingQty));
         body.put("ORD_UNPR", "0");
         body.put("QTY_ALL_ORD_YN", "Y");
@@ -139,8 +143,16 @@ public class KisBrokerClient implements BrokerPort {
         if (!"0".equals(rtCd)) {
             throw new KisOrderRejectedException(rtCd, textOrNull(response.path("msg1")));
         }
-        String odno = strictText(response.path("output").path("ODNO"), "output.ODNO");
-        return new KisOrderAck(odno);
+        JsonNode output = response.path("output");
+        String odno = strictText(output.path("ODNO"), "output.ODNO");
+        // 방어적 파싱 — 필드 부재/공백이면 null(취소 시 공백 전송으로 폴백). ODNO와 달리
+        // strict 검증하지 않는다: 이 필드는 응답에 없을 수 있는 것이 정상 케이스다.
+        String krxFwdgOrdOrgno = orNullIfBlank(textOrNull(output.path("KRX_FWDG_ORD_ORGNO")));
+        return new KisOrderAck(odno, krxFwdgOrdOrgno);
+    }
+
+    private static String orNullIfBlank(String s) {
+        return (s == null || s.isBlank()) ? null : s;
     }
 
     @Override

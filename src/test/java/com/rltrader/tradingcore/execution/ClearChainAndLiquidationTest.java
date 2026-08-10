@@ -362,7 +362,7 @@ class ClearChainAndLiquidationTest extends AbstractIntegrationTest {
         assertThat(order.getStatus()).isEqualTo(OrderStatus.FILLED);
         assertThat(out.totalFilledQty()).isEqualTo(10);
         // 15:25 시점엔 취소가 전송되지 않았어야 한다 (일반 fillTimeout 미적용)
-        verify(broker, never()).cancelOrder(anyString(), anyLong());
+        verify(broker, never()).cancelOrder(anyString(), anyLong(), any());
         assertThat(decisions.findById(d).orElseThrow().getExecutionStatus()).isEqualTo("COMPLETED");
     }
 
@@ -390,7 +390,7 @@ class ClearChainAndLiquidationTest extends AbstractIntegrationTest {
 
         OrderEntity order = orders.findTopByDecisionIdOrderByAttemptDesc(d).orElseThrow();
         assertThat(order.getStatus()).isEqualTo(OrderStatus.CANCELLED);
-        verify(broker, times(1)).cancelOrder(anyString(), anyLong());
+        verify(broker, times(1)).cancelOrder(anyString(), anyLong(), any());
 
         var snap = snapshots.findById("005930").orElseThrow();
         assertThat(snap.isLiquidationPending()).isTrue();

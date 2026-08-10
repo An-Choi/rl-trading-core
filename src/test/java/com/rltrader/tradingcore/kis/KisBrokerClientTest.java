@@ -36,11 +36,25 @@ class KisBrokerClientTest {
     void submit_buy_returns_ack() {
         wm.stubFor(post(urlEqualTo("/uapi/domestic-stock/v1/trading/order-cash"))
                 .withHeader("tr_id", equalTo("VTTC0802U"))
+                .willReturn(okJson("""
+                    {"rt_cd":"0","output":{"ODNO":"0000012345","KRX_FWDG_ORD_ORGNO":"05360"}}""")));
+        KisOrderAck ack = client.submitMarketOrder("005930", OrderSide.BUY, 10);
+        assertThat(ack.kisOrderNo()).isEqualTo("0000012345");
+        assertThat(ack.krxFwdgOrdOrgno()).isEqualTo("05360");
+        wm.verify(postRequestedFor(urlEqualTo("/uapi/domestic-stock/v1/trading/order-cash"))
+                .withRequestBody(matchingJsonPath("$.ORD_DVSN", equalTo("01"))));  // 시장가
+    }
+
+    // Fix 1 — 원주문 ack에 KRX_FWDG_ORD_ORGNO가 없거나 공백이면 방어적으로 null(부재는
+    // 증명이 아니다 — 취소 시 공백 전송으로 폴백).
+    @Test
+    void submit_buy_without_org_no_in_ack_parses_as_null() {
+        wm.stubFor(post(urlEqualTo("/uapi/domestic-stock/v1/trading/order-cash"))
+                .withHeader("tr_id", equalTo("VTTC0802U"))
                 .willReturn(okJson("{\"rt_cd\":\"0\",\"output\":{\"ODNO\":\"0000012345\"}}")));
         KisOrderAck ack = client.submitMarketOrder("005930", OrderSide.BUY, 10);
         assertThat(ack.kisOrderNo()).isEqualTo("0000012345");
-        wm.verify(postRequestedFor(urlEqualTo("/uapi/domestic-stock/v1/trading/order-cash"))
-                .withRequestBody(matchingJsonPath("$.ORD_DVSN", equalTo("01"))));  // 시장가
+        assertThat(ack.krxFwdgOrdOrgno()).isNull();
     }
 
     @Test
@@ -123,21 +137,34 @@ class KisBrokerClientTest {
     @Test
     void cancel_order_sends_expected_body_and_succeeds() {
         wm.stubFor(post(urlEqualTo("/uapi/domestic-stock/v1/trading/order-rvsecncl"))
-                .withHeader("tr_id", equalTo("VTTC0803U"))
+                .withHeader("tr_id", equalTo("VTTC0013U"))
                 .willReturn(okJson("{\"rt_cd\":\"0\",\"output\":{\"ODNO\":\"0000099999\"}}")));
-        client.cancelOrder("0000012345", 5);
+        client.cancelOrder("0000012345", 5, "05360");
         wm.verify(postRequestedFor(urlEqualTo("/uapi/domestic-stock/v1/trading/order-rvsecncl"))
                 .withRequestBody(matchingJsonPath("$.ORGN_ODNO", equalTo("0000012345")))
                 .withRequestBody(matchingJsonPath("$.RVSE_CNCL_DVSN_CD", equalTo("02")))
                 .withRequestBody(matchingJsonPath("$.ORD_QTY", equalTo("5")))
-                .withRequestBody(matchingJsonPath("$.ORD_DVSN", equalTo("00"))));
+                .withRequestBody(matchingJsonPath("$.ORD_DVSN", equalTo("00")))
+                .withRequestBody(matchingJsonPath("$.EXCG_ID_DVSN_CD", equalTo("KRX")))
+                .withRequestBody(matchingJsonPath("$.KRX_FWDG_ORD_ORGNO", equalTo("05360"))));
+    }
+
+    // Fix 1 — 원주문 ack에 조직번호가 없었던 경우(null) 취소 요청은 공백을 전송한다.
+    @Test
+    void cancel_order_with_no_org_no_sends_blank() {
+        wm.stubFor(post(urlEqualTo("/uapi/domestic-stock/v1/trading/order-rvsecncl"))
+                .withHeader("tr_id", equalTo("VTTC0013U"))
+                .willReturn(okJson("{\"rt_cd\":\"0\",\"output\":{\"ODNO\":\"0000099999\"}}")));
+        client.cancelOrder("0000012345", 5, null);
+        wm.verify(postRequestedFor(urlEqualTo("/uapi/domestic-stock/v1/trading/order-rvsecncl"))
+                .withRequestBody(matchingJsonPath("$.KRX_FWDG_ORD_ORGNO", equalTo(""))));
     }
 
     @Test
     void cancel_order_rejection_raises_typed_exception() {
         wm.stubFor(post(urlEqualTo("/uapi/domestic-stock/v1/trading/order-rvsecncl"))
                 .willReturn(okJson("{\"rt_cd\":\"1\",\"msg_cd\":\"40250099\",\"msg1\":\"취소 불가\"}")));
-        assertThatThrownBy(() -> client.cancelOrder("0000012345", 5))
+        assertThatThrownBy(() -> client.cancelOrder("0000012345", 5, "05360"))
                 .isInstanceOf(KisOrderRejectedException.class);
     }
 
