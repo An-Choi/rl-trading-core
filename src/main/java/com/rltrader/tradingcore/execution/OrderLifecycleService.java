@@ -121,14 +121,30 @@ public class OrderLifecycleService {
 
             // — 타임아웃(또는 terminalCandidate가 아니지만 데드라인 도달): 취소
             hadTimeout = true;
-            finalization.transition(order, OrderStatus.CANCEL_PENDING, Map.of());
-            cancelOrThrow(order);
+            // Fix 3 — 마지막 폴링 스냅숏이 이미 brokerTerminal && cancelled를 보고했다면(브로커
+            // 관점에서 이미 취소가 확정된 상태), CANCEL_PENDING 전이 + cancelOrder POST를 다시
+            // 보내지 않는다. 이미 취소된 주문에 취소를 재요청하면 KIS가 거부할 수 있고, 그 거부가
+            // cancelOrThrow의 ChainIncompleteException으로 이어져 체인이 비종결로 멈춘다 — "이미
+            // 취소 확정 관찰"과 "우리가 취소를 요청해 확정" 두 경로가 최종적으로 같은 REST 확정 +
+            // 부분체결 정책으로 수렴해야 하므로, 여기서는 그 확정 조회로 바로 건너뛴다(체결
+            // 우선(fill-wins) 규칙은 아래 confirmed.cumulativeFilledQty() 판정에서 그대로 유지).
+            boolean alreadyObservedCancelled = polled != null && polled.brokerTerminal() && polled.cancelled();
+            if (!alreadyObservedCancelled) {
+                finalization.transition(order, OrderStatus.CANCEL_PENDING, Map.of());
+                cancelOrThrow(order);
+            }
+            // CANCEL_PENDING을 건너뛴 경우 order.getStatus()는 여전히 ACKED/PARTIALLY_FILLED이므로
+            // 이후 모든 종결 커밋(FILLED든 CANCELLED든)은 RECOVERY 점프표를 써야 한다(정상 전이표는
+            // CANCEL_PENDING 경유만 허용) — 그 값을 넘겨받는 마지막 finalizeChain까지 이 attempt
+            // 반복 전체에서 일관되게 사용한다.
+            TransitionMode cancelFinalizeMode = alreadyObservedCancelled
+                    ? TransitionMode.RECOVERY : TransitionMode.NORMAL;
             KisOrderSnapshot confirmed = confirmOrThrow(order);
 
             if (confirmed.cumulativeFilledQty() >= order.getQty()) {
                 // 레이스: 취소 확정 조회가 전량 체결을 반환 — 체결 우선
                 ChainOutcome outcome = finalizeFilled(order, confirmed, barTs, before, ctx,
-                        priorAccountedQty, priorNotional, hadTimeout);
+                        priorAccountedQty, priorNotional, hadTimeout, cancelFinalizeMode);
                 return outcome;
             }
 
@@ -158,7 +174,7 @@ public class OrderLifecycleService {
                 // 재개된 이월 체인은 true를 다시 커밋해야 pendingActive()가 계속 이 decision을
                 // 찾을 수 있다(완료 전 중간 커밋에서 조용히 꺼지는 것을 방지).
                 finalization.finalizeChain(order, OrderStatus.CANCELLED, confirmed, after,
-                        ChainNext.retry(nextOrder, liquidationCarried), ctx, TransitionMode.NORMAL);
+                        ChainNext.retry(nextOrder, liquidationCarried), ctx, cancelFinalizeMode);
                 order = nextOrder;
                 before = after;
                 continue;
@@ -170,7 +186,7 @@ public class OrderLifecycleService {
                 PortfolioState after = applyFill(before, order, barTs, currentAttemptQty, decisionTotalQty,
                         balance, false);
                 finalization.finalizeChain(order, OrderStatus.CANCELLED, confirmed, after,
-                        ChainNext.liquidation(), ctx, TransitionMode.NORMAL);
+                        ChainNext.liquidation(), ctx, cancelFinalizeMode);
                 alerts.record("PARTIAL_CLEAR_EOD", barTs, Map.of(
                         "decisionId", decisionId, "filledQty", decisionTotalQty, "remainingQty", remaining));
                 return new ChainOutcome(after, priorNotional.add(currentNotional), decisionTotalQty, true, hadTimeout);
@@ -181,7 +197,7 @@ public class OrderLifecycleService {
             PortfolioState after = applyFill(before, order, barTs, currentAttemptQty, decisionTotalQty,
                     balance, true);
             finalization.finalizeChain(order, OrderStatus.CANCELLED, confirmed, after,
-                    ChainNext.markCompleted(), ctx, TransitionMode.NORMAL);
+                    ChainNext.markCompleted(), ctx, cancelFinalizeMode);
             if (decisionTotalQty > 0) {
                 alerts.record("PARTIAL_UNIT", barTs, Map.of(
                         "decisionId", decisionId, "filledQty", decisionTotalQty, "orderedQty", plan.qty()));
@@ -209,12 +225,19 @@ public class OrderLifecycleService {
         if (confirmed.cumulativeFilledQty() < order.getQty()) {
             return null;
         }
-        return finalizeFilled(order, confirmed, barTs, before, ctx, priorAccountedQty, priorNotional, hadTimeout);
+        return finalizeFilled(order, confirmed, barTs, before, ctx, priorAccountedQty, priorNotional,
+                hadTimeout, TransitionMode.NORMAL);
     }
 
+    /**
+     * mode는 호출부의 order.getStatus() 실제 값에 맞춰 골라야 한다 — NORMAL은 ACKED/PARTIALLY_FILLED
+     * →FILLED(정상 전이표에 있음), RECOVERY는 Fix 3(이미 취소 관찰된 주문의 취소 재요청 생략) 경로
+     * 전용: CANCEL_PENDING을 거치지 않았는데 그 상태를 거친 것처럼 커밋하면 안 되므로, 실제
+     * 마지막 커밋 상태(ACKED/PARTIALLY_FILLED)에서 FILLED로의 관찰 점프로 취급한다.
+     */
     private ChainOutcome finalizeFilled(OrderEntity order, KisOrderSnapshot confirmed, ZonedDateTime barTs,
             PortfolioState before, ArtifactContext ctx, long priorAccountedQty, BigDecimal priorNotional,
-            boolean hadTimeout) {
+            boolean hadTimeout, TransitionMode mode) {
         KisBalance balance = balanceOrThrow();
         long currentAttemptQty = confirmed.cumulativeFilledQty();
         BigDecimal currentNotional = confirmed.cumulativeAvgPrice()
@@ -222,7 +245,7 @@ public class OrderLifecycleService {
         long decisionTotalQty = priorAccountedQty + currentAttemptQty;
         PortfolioState after = applyFill(before, order, barTs, currentAttemptQty, decisionTotalQty, balance, true);
         finalization.finalizeChain(order, OrderStatus.FILLED, confirmed, after, ChainNext.markCompleted(),
-                ctx, TransitionMode.NORMAL);
+                ctx, mode);
         return new ChainOutcome(after, priorNotional.add(currentNotional), decisionTotalQty, false, hadTimeout);
     }
 

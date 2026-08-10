@@ -224,6 +224,62 @@ class OrderLifecycleCancelRetryTest extends AbstractIntegrationTest {
         assertThat(events).extracting("toStatus").doesNotContain("CANCELLED");
     }
 
+    /**
+     * Fix 3 (P2) — 폴링의 마지막 스냅숏이 이미 brokerTerminal && cancelled(부분 체결인 채 취소
+     * 확정)를 보고했다면, CANCEL_PENDING 전이나 cancelOrder POST를 다시 보내지 않고 곧바로 REST
+     * 확정 + 부분체결 정책(포기)으로 진행해야 한다. 이미 취소된 주문에 취소를 재요청하면 KIS가
+     * 거부해 체인이 비종결로 멈추는 회귀를 방지한다.
+     */
+    @Test
+    void poll_observed_cancelled_skips_recancel_and_finalizes_with_partial_policy() {
+        long d = decisionWithNewOrder(10);
+        when(broker.submitMarketOrder("005930", OrderSide.BUY, 10))
+                .thenReturn(new KisOrderAck("0001"));
+        when(broker.submitMarketOrder("005930", OrderSide.BUY, 7))
+                .thenReturn(new KisOrderAck("0002"));
+        // attempt 1: 3주 체결 후 타임아웃 -> 정상 취소 흐름(취소 요청 O) -> 잔량 7, 재시도.
+        when(broker.orderSnapshot(eq("0001"), any(LocalDate.class)))
+                .thenAnswer(inv -> {
+                    mutableClock().advance(Duration.ofSeconds(61));
+                    return Optional.of(new KisOrderSnapshot("0001", 10, 3, new BigDecimal("101.0"), false, false));
+                })
+                .thenReturn(Optional.of(new KisOrderSnapshot("0001", 10, 3, new BigDecimal("101.0"), true, true)));
+        // attempt 2(잔량 7, submitRetryMax=1 도달 — 더 이상 재시도 없음): 폴링 유일 응답이 이미
+        // brokerTerminal && cancelled(2주 체결, 취소 확정 관찰) — Fix 3 대상 케이스. (참고:
+        // cumulativeFilledQty(2) < qty(7)이고 cancelled=true이므로 filledCandidate는 false —
+        // 정상적으로 타임아웃/취소 분기로 진입한다.)
+        when(broker.orderSnapshot(eq("0002"), any(LocalDate.class)))
+                .thenAnswer(inv -> {
+                    mutableClock().advance(Duration.ofSeconds(61));
+                    return Optional.of(new KisOrderSnapshot("0002", 7, 2, new BigDecimal("101.0"), true, true));
+                });
+        when(broker.balance())
+                .thenReturn(new KisBalance(3, new BigDecimal("9697.00")))   // attempt1 finalization
+                .thenReturn(new KisBalance(5, new BigDecimal("9495.00"))); // attempt2 finalization
+
+        ChainOutcome out = lifecycle.runChain(d, new OrderPlan(OrderSide.BUY, 10),
+                TestFixtures.bar("2026-08-07T09:35"), TestFixtures.flat(10_000), TestFixtures.ctx());
+
+        // attempt1은 정상 취소(취소 요청 1회), attempt2는 이미 관찰된 취소이므로 재요청 없음 —
+        // 합쳐서 정확히 1회.
+        verify(broker, times(1)).cancelOrder(anyString(), anyLong(), any());
+
+        OrderEntity attempt2 = orders.findTopByDecisionIdOrderByAttemptDesc(d).orElseThrow();
+        assertThat(attempt2.getAttempt()).isEqualTo(2);
+        assertThat(attempt2.getStatus()).isEqualTo(OrderStatus.CANCELLED);
+        assertThat(attempt2.getAccountedFilledQty()).isEqualTo(2L);
+        assertThat(decisions.findById(d).orElseThrow().getExecutionStatus()).isEqualTo("COMPLETED");
+        assertThat(out.totalFilledQty()).isEqualTo(5);   // attempt1(3) + attempt2(2)
+        assertThat(out.after().units()).isEqualTo(1);
+
+        // attempt2의 이벤트에는 CANCEL_PENDING이 없어야 한다 — 관찰 점프로 곧바로 CANCELLED.
+        var attempt2Events = TestFixtures.eventsFor(orderEvents, attempt2);
+        assertThat(attempt2Events).extracting("toStatus").doesNotContain("CANCEL_PENDING");
+        assertThat(attempt2Events).extracting("toStatus").contains("CANCELLED");
+
+        assertThat(alerts.findAll()).anySatisfy(a -> assertThat(a.getCode()).isEqualTo("PARTIAL_UNIT"));
+    }
+
     @Test
     void in_process_chain_total_includes_prior_attempt_fills() {
         long d = decisionWithNewOrder(10);
