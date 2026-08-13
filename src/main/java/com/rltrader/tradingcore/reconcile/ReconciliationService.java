@@ -651,15 +651,26 @@ public class ReconciliationService {
                 "cash", Map.of("result", cashResult, "local", localCash, "kis", kisCash)));
     }
 
-    /** cash 불일치 → 예수금 절대값으로 snapshot·메모리 동기화(단방향 로컬←KIS, spec §6). 한 tx. */
+    /**
+     * cash 불일치 → 예수금 절대값으로 snapshot·메모리 동기화(단방향 로컬←KIS, spec §6). 한 tx.
+     *
+     * <p>snapshot 행이 없으면(최초 live 기동 — 아직 어떤 finalization도 없음) DB는 건드리지 않고
+     * **메모리만** 동기화한다. 행 생성은 finalization의 소유(첫 거래에서 생성)이고, 여기서 행을
+     * 만들면 artifact provenance 등 finalization의 규칙을 대사가 복제하게 된다. 재기동 시 flat
+     * 복원 → 이 동기화가 다시 도는 것은 멱등·무해하다. (2026-08-13 기동 스모크 실측 결함 수정 —
+     * 이전 코드는 행 존재를 전제(orElseThrow)해 최초 기동을 죽였다.)
+     */
     private void syncCashFromBalance(BigDecimal kisCash) {
+        PortfolioState before = portfolio.current();
+        PortfolioState next = new PortfolioState(before.units(), before.shares(),
+                kisCash.doubleValue(), before.entryBarTs());
+        var existing = snapshots.findById(tradingProps.symbol());
+        if (existing.isEmpty()) {
+            portfolio.apply(next);   // 커밋할 것이 없으므로 메모리 직접 갱신
+            return;
+        }
         PortfolioState after = tx.execute(status -> {
-            PortfolioState before = portfolio.current();
-            PortfolioState next = new PortfolioState(before.units(), before.shares(),
-                    kisCash.doubleValue(), before.entryBarTs());
-            PortfolioSnapshotEntity snapshotEntity = snapshots.findById(tradingProps.symbol())
-                    .orElseThrow(() -> new IllegalStateException(
-                            "no portfolio snapshot for " + tradingProps.symbol() + " — cannot sync cash"));
+            PortfolioSnapshotEntity snapshotEntity = existing.get();
             snapshotEntity.setCash(next.cash());
             snapshotEntity.setUpdatedAt(OffsetDateTime.now(clock));
             snapshots.save(snapshotEntity);

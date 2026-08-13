@@ -675,6 +675,25 @@ class ReconciliationServiceTest extends AbstractIntegrationTest {
                 assertThat(row.get("result")).isEqualTo("SYNCED"));
     }
 
+    @Test
+    void first_boot_cash_mismatch_syncs_memory_without_snapshot_row() {
+        // 기동 스모크 실측 결함(2026-08-13): 최초 live 기동은 snapshot 행이 아예 없다(행 생성은
+        // finalization 소유). 이때 로컬 flat 초기값과 실제 예수금이 불일치하면 cash 동기화가
+        // "행 존재" 전제(orElseThrow)로 기동 자체를 죽였다. 요구: 행이 없으면 DB는 건드리지 않고
+        // 메모리만 예수금으로 동기화(SYNCED), 행 생성은 여전히 첫 finalization의 몫.
+        portfolio.apply(PortfolioState.flat(10_000.0));   // restore가 만든 flat 메모리 상태
+        assertThat(snapshots.findById(SYMBOL)).isEmpty();
+
+        when(broker.balance()).thenReturn(new KisBalance(0, new BigDecimal("10000000.00")));
+
+        recon.reconcile(Trigger.STARTUP);
+
+        assertThat(portfolio.current().cash()).isEqualTo(10_000_000.00);
+        assertThat(snapshots.findById(SYMBOL)).isEmpty();   // 행 생성 금지 — finalization 소유
+        assertThat(reconRows("BALANCE")).anySatisfy(row ->
+                assertThat(row.get("result")).isEqualTo("SYNCED"));
+    }
+
     // ---------------------------------------------------------------- 시나리오 7 (브리프 추가 케이스)
 
     @Test
