@@ -1,5 +1,24 @@
 # rl-trading-core
 
+## 연구용 목표 비중 재생
+
+Java 21과 [Python 연구 서버](https://github.com/An-Choi/real_market_rl_trader)가 필요합니다.
+
+```bash
+./gradlew researchDryRun --args='--url http://127.0.0.1:8766 --output /tmp/NEW-replay --restart-at 25'
+```
+
+이 CLI는 Spring·DB·브로커 클라이언트를 생성하지 않습니다. 목표 비중 6개 행동의
+주문 계획과 현금·주식 수·원가를 Python 상태와 대조합니다. 실제 주문을 전송하지 않습니다.
+portfolio.json을 --resume PATH로 재개할 수 있으며 같은 Python 세션이 살아 있어야 합니다.
+전체 Java 테스트 165개와 bootJar를 검증했습니다. Docker 대신 로컬 PostgreSQL 테스트도 가능합니다.
+
+```bash
+RL_TEST_PG_BASE_URL=jdbc:postgresql://127.0.0.1:5432/postgres RL_TEST_PG_USER=YOUR_LOCAL_USER RL_TEST_PG_PASSWORD=YOUR_LOCAL_PASSWORD ./gradlew test
+```
+
+각 테스트 프로세스가 독립 DB를 생성·정리합니다. 아래는 별도의 기존 운영 경로입니다.
+
 RL 예측 서버(predict server)의 결정을 5분 grid로 소비해 **모의(dry-run) 체결**을 기록하는
 Spring Boot 트레이딩 코어. **1차 릴리스는 dry-run 전용이며 실주문은 나가지 않는다** —
 모든 체결은 `DryRunExecutor`가 메모리·DB 상의 포트폴리오만 갱신한다.

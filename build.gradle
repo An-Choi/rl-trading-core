@@ -46,3 +46,10 @@ tasks.named('test') {
 	// 연속 실행하면 재현). forkEvery=1로 클래스당 새 JVM을 받게 하여 회피.
 	forkEvery = 1
 }
+
+tasks.register('researchDryRun', JavaExec) {
+	group = 'application'
+	description = 'Verify the loopback Python research policy with independent Java accounting'
+	classpath = sourceSets.main.runtimeClasspath
+	mainClass = 'com.rltrader.tradingcore.research.ResearchDryRun'
+}
