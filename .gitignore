@@ -36,3 +36,13 @@ out/
 ### VS Code ###
 .vscode/
 /config/application-local.yml
+.env
+.env.*
+!.env.example
+
+# Research replay output and private material
+*.log
+/research-dry-run/
+/releases/
+*.pem
+*.key
